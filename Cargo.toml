@@ -1,0 +1,22 @@
+[package]
+name = "tpm-ops"
+version = "0.1.0"
+edition = "2021"
+description = "TPM 2.0 operations tool for Infineon SLB9672"
+license = "MIT"
+
+[dependencies]
+tss-esapi = "7"
+tss-esapi-sys = "0.5"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+hex = "0.4"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
