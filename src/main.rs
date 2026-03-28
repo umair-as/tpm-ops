@@ -105,18 +105,18 @@ fn main() -> Result<()> {
     }
 }
 
-fn get_property(context: &mut TpmContext, tag: PropertyTag) -> u32 {
-    context.get_tpm_property(tag).ok().flatten().unwrap_or(0)
+fn get_property(context: &mut TpmContext, tag: PropertyTag) -> Result<Option<u32>> {
+    context
+        .get_tpm_property(tag)
+        .context("Failed to read TPM property")
 }
 
 fn cmd_info(context: &mut TpmContext) -> Result<()> {
     info!("=== TPM Information ===");
 
-    let manufacturer = get_property(context, PropertyTag::Manufacturer);
-    let vendor1 = get_property(context, PropertyTag::VendorString1);
-    let vendor2 = get_property(context, PropertyTag::VendorString2);
-    let vendor3 = get_property(context, PropertyTag::VendorString3);
-    let vendor4 = get_property(context, PropertyTag::VendorString4);
+    // Manufacturer is the critical field — fail if unreadable
+    let manufacturer = get_property(context, PropertyTag::Manufacturer)?
+        .ok_or_else(|| anyhow::anyhow!("TPM did not report manufacturer — device may be unresponsive"))?;
 
     let mfr_bytes = manufacturer.to_be_bytes();
     let mfr_str: String = mfr_bytes
@@ -124,24 +124,32 @@ fn cmd_info(context: &mut TpmContext) -> Result<()> {
         .filter(|&&b| b != 0)
         .map(|&b| b as char)
         .collect();
-
     println!("Manufacturer: {} (0x{:08X})", mfr_str, manufacturer);
 
-    let vendor_str = [vendor1, vendor2, vendor3, vendor4]
+    // Vendor strings are optional — print what we can
+    let vendor_vals = [
+        PropertyTag::VendorString1,
+        PropertyTag::VendorString2,
+        PropertyTag::VendorString3,
+        PropertyTag::VendorString4,
+    ]
+    .map(|tag| get_property(context, tag).ok().flatten().unwrap_or(0));
+
+    let vendor_str = vendor_vals
         .iter()
         .flat_map(|v| v.to_be_bytes())
         .filter(|&b| b != 0 && b.is_ascii())
         .map(|b| b as char)
         .collect::<String>();
-    println!("Vendor: {}", vendor_str);
+    if !vendor_str.is_empty() {
+        println!("Vendor: {}", vendor_str);
+    }
 
-    let fw1 = get_property(context, PropertyTag::FirmwareVersion1);
-    if fw1 != 0 {
+    if let Some(fw1) = get_property(context, PropertyTag::FirmwareVersion1)? {
         println!("Firmware: {}.{}", fw1 >> 16, fw1 & 0xFFFF);
     }
 
-    let rev = get_property(context, PropertyTag::Revision);
-    if rev != 0 {
+    if let Some(rev) = get_property(context, PropertyTag::Revision)? {
         println!("Spec Revision: {}.{}", rev / 100, rev % 100);
     }
 
@@ -225,6 +233,33 @@ fn cmd_hash(context: &mut TpmContext, data: &str, algo: &str) -> Result<()> {
     Ok(())
 }
 
+/// RAII guard that flushes a transient TPM key handle on drop
+struct KeyGuard<'a> {
+    context: &'a mut TpmContext,
+    handle: Option<KeyHandle>,
+}
+
+impl<'a> KeyGuard<'a> {
+    fn new(context: &'a mut TpmContext, handle: KeyHandle) -> Self {
+        Self {
+            context,
+            handle: Some(handle),
+        }
+    }
+
+    fn handle(&self) -> KeyHandle {
+        self.handle.expect("handle already taken")
+    }
+}
+
+impl Drop for KeyGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            let _ = self.context.flush_context(h.into());
+        }
+    }
+}
+
 fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
     let session = context
         .start_auth_session(
@@ -236,7 +271,7 @@ fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
             HashingAlgorithm::Sha256,
         )
         .context("Failed to start auth session")?
-        .expect("Session should be Some");
+        .ok_or_else(|| anyhow::anyhow!("Auth session creation returned None"))?;
 
     context.set_sessions((Some(session), None, None));
 
@@ -251,13 +286,17 @@ fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
         create_rsa_primary(context)?
     };
 
-    info!("Primary key created: {:?}", primary_key);
+    // Guard ensures flush_context runs even if hash/sign fails below
+    let guard = KeyGuard::new(context, primary_key);
+
+    info!("Primary key created: {:?}", guard.handle());
 
     let data_bytes = data.as_bytes();
     let buffer = MaxBuffer::try_from(data_bytes).context("Data too large")?;
 
     // hash() returns both digest and the ticket needed for sign()
-    let (digest, ticket) = context
+    let (digest, ticket) = guard
+        .context
         .hash(buffer, HashingAlgorithm::Sha256, Hierarchy::Null)
         .context("Failed to hash data")?;
 
@@ -273,8 +312,9 @@ fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
         }
     };
 
-    let signature = context
-        .sign(primary_key, digest.clone(), scheme, ticket)
+    let signature = guard
+        .context
+        .sign(guard.handle(), digest.clone(), scheme, ticket)
         .context("Failed to sign data")?;
 
     println!("\nData: {}", data);
@@ -294,8 +334,7 @@ fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
         _ => println!("{:?}", signature),
     }
 
-    context.flush_context(primary_key.into())?;
-
+    // guard drops here, flushing the key handle
     println!("\nKey created, data signed, key flushed [OK]");
     Ok(())
 }
