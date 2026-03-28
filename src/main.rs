@@ -3,14 +3,14 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use log::info;
-use std::convert::TryFrom;
+use std::str::FromStr;
 
 use tss_esapi::{
     attributes::ObjectAttributesBuilder,
-    constants::SessionType,
+    constants::{PropertyTag, SessionType},
     handles::KeyHandle,
     interface_types::{
-        algorithm::{HashingAlgorithm, PublicAlgorithm, SignatureSchemeAlgorithm},
+        algorithm::{HashingAlgorithm, PublicAlgorithm},
         ecc::EccCurve,
         key_bits::RsaKeyBits,
         resource_handles::Hierarchy,
@@ -19,7 +19,7 @@ use tss_esapi::{
         EccPoint, EccScheme, HashScheme, KeyDerivationFunctionScheme, MaxBuffer,
         PcrSelectionListBuilder, PcrSlot, PublicBuilder, PublicEccParametersBuilder,
         PublicKeyRsa, PublicRsaParametersBuilder, RsaExponent, RsaScheme, SignatureScheme,
-        SymmetricDefinitionObject,
+        SymmetricDefinition,
     },
     tcti_ldr::{DeviceConfig, TctiNameConf},
     Context as TpmContext,
@@ -89,8 +89,9 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    let tcti_conf =
-        TctiNameConf::Device(DeviceConfig::from_path(std::path::PathBuf::from(&cli.device)));
+    let device_config =
+        DeviceConfig::from_str(&cli.device).context("Invalid TCTI device path")?;
+    let tcti_conf = TctiNameConf::Device(device_config);
 
     let mut context = TpmContext::new(tcti_conf).context("Failed to create TPM context")?;
 
@@ -104,27 +105,18 @@ fn main() -> Result<()> {
     }
 }
 
+fn get_property(context: &mut TpmContext, tag: PropertyTag) -> u32 {
+    context.get_tpm_property(tag).ok().flatten().unwrap_or(0)
+}
+
 fn cmd_info(context: &mut TpmContext) -> Result<()> {
     info!("=== TPM Information ===");
 
-    let (manufacturer, vendor1, vendor2, vendor3, vendor4) = context
-        .get_tpm_property(tss_esapi::constants::tss::TPM2_PT_MANUFACTURER)
-        .map(|m| {
-            let v1 = context
-                .get_tpm_property(tss_esapi::constants::tss::TPM2_PT_VENDOR_STRING_1)
-                .unwrap_or(0);
-            let v2 = context
-                .get_tpm_property(tss_esapi::constants::tss::TPM2_PT_VENDOR_STRING_2)
-                .unwrap_or(0);
-            let v3 = context
-                .get_tpm_property(tss_esapi::constants::tss::TPM2_PT_VENDOR_STRING_3)
-                .unwrap_or(0);
-            let v4 = context
-                .get_tpm_property(tss_esapi::constants::tss::TPM2_PT_VENDOR_STRING_4)
-                .unwrap_or(0);
-            (m, v1, v2, v3, v4)
-        })
-        .unwrap_or((0, 0, 0, 0, 0));
+    let manufacturer = get_property(context, PropertyTag::Manufacturer);
+    let vendor1 = get_property(context, PropertyTag::VendorString1);
+    let vendor2 = get_property(context, PropertyTag::VendorString2);
+    let vendor3 = get_property(context, PropertyTag::VendorString3);
+    let vendor4 = get_property(context, PropertyTag::VendorString4);
 
     let mfr_bytes = manufacturer.to_be_bytes();
     let mfr_str: String = mfr_bytes
@@ -143,13 +135,13 @@ fn cmd_info(context: &mut TpmContext) -> Result<()> {
         .collect::<String>();
     println!("Vendor: {}", vendor_str);
 
-    if let Ok(fw1) =
-        context.get_tpm_property(tss_esapi::constants::tss::TPM2_PT_FIRMWARE_VERSION_1)
-    {
+    let fw1 = get_property(context, PropertyTag::FirmwareVersion1);
+    if fw1 != 0 {
         println!("Firmware: {}.{}", fw1 >> 16, fw1 & 0xFFFF);
     }
 
-    if let Ok(rev) = context.get_tpm_property(tss_esapi::constants::tss::TPM2_PT_REVISION) {
+    let rev = get_property(context, PropertyTag::Revision);
+    if rev != 0 {
         println!("Spec Revision: {}.{}", rev / 100, rev % 100);
     }
 
@@ -168,8 +160,8 @@ fn cmd_random(context: &mut TpmContext, num_bytes: usize) -> Result<()> {
         .get_random(num_bytes)
         .context("Failed to get random bytes from TPM")?;
 
-    println!("Random bytes ({} bytes):", random_bytes.len());
-    println!("{}", hex::encode(random_bytes.as_bytes()));
+    println!("Random bytes ({} bytes):", num_bytes);
+    println!("{}", hex::encode(random_bytes.value()));
 
     Ok(())
 }
@@ -180,7 +172,7 @@ fn cmd_pcr(context: &mut TpmContext, index: u8, algo: &str) -> Result<()> {
     }
 
     let hash_algo = parse_hash_algo(algo)?;
-    let pcr_slot = PcrSlot::try_from(index).context("Invalid PCR slot")?;
+    let pcr_slot = PcrSlot::try_from(index as u32).context("Invalid PCR slot")?;
 
     let pcr_selection = PcrSelectionListBuilder::new()
         .with_selection(hash_algo, &[pcr_slot])
@@ -189,15 +181,16 @@ fn cmd_pcr(context: &mut TpmContext, index: u8, algo: &str) -> Result<()> {
 
     info!("Reading PCR {} with {}...", index, algo.to_uppercase());
 
-    let (_, _, pcr_data) = context.pcr_read(pcr_selection).context("Failed to read PCR")?;
+    let (_, _, digest_list) = context.pcr_read(pcr_selection).context("Failed to read PCR")?;
 
-    if let Some(digests) = pcr_data.pcr_bank(hash_algo) {
-        for (slot, digest) in digests {
-            println!("PCR[{}] ({}):", u8::from(*slot), algo.to_uppercase());
-            println!("{}", hex::encode(digest.as_bytes()));
-        }
-    } else {
+    let digests = digest_list.value();
+    if digests.is_empty() {
         println!("PCR[{}]: (empty)", index);
+    } else {
+        for digest in digests {
+            println!("PCR[{}] ({}):", index, algo.to_uppercase());
+            println!("{}", hex::encode(digest.value()));
+        }
     }
 
     Ok(())
@@ -227,7 +220,7 @@ fn cmd_hash(context: &mut TpmContext, data: &str, algo: &str) -> Result<()> {
         .context("Failed to hash data")?;
 
     println!("{} hash:", algo.to_uppercase());
-    println!("{}", hex::encode(digest.as_bytes()));
+    println!("{}", hex::encode(digest.value()));
 
     Ok(())
 }
@@ -239,7 +232,7 @@ fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
             None,
             None,
             SessionType::Hmac,
-            SymmetricDefinitionObject::AES_128_CFB,
+            SymmetricDefinition::AES_128_CFB,
             HashingAlgorithm::Sha256,
         )
         .context("Failed to start auth session")?
@@ -263,7 +256,8 @@ fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
     let data_bytes = data.as_bytes();
     let buffer = MaxBuffer::try_from(data_bytes).context("Data too large")?;
 
-    let (digest, _) = context
+    // hash() returns both digest and the ticket needed for sign()
+    let (digest, ticket) = context
         .hash(buffer, HashingAlgorithm::Sha256, Hierarchy::Null)
         .context("Failed to hash data")?;
 
@@ -280,22 +274,22 @@ fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
     };
 
     let signature = context
-        .sign(primary_key, digest.clone(), scheme, None)
+        .sign(primary_key, digest.clone(), scheme, ticket)
         .context("Failed to sign data")?;
 
     println!("\nData: {}", data);
-    println!("Digest (SHA256): {}", hex::encode(digest.as_bytes()));
+    println!("Digest (SHA256): {}", hex::encode(digest.value()));
     println!("\nSignature:");
 
     match signature {
         tss_esapi::structures::Signature::RsaSsa(sig) => {
             println!("Algorithm: RSA-SSA");
-            println!("Signature: {}", hex::encode(sig.signature().as_bytes()));
+            println!("Signature: {}", hex::encode(sig.signature().value()));
         }
         tss_esapi::structures::Signature::EcDsa(sig) => {
             println!("Algorithm: ECDSA");
-            println!("R: {}", hex::encode(sig.signature_r().as_bytes()));
-            println!("S: {}", hex::encode(sig.signature_s().as_bytes()));
+            println!("R: {}", hex::encode(sig.signature_r().value()));
+            println!("S: {}", hex::encode(sig.signature_s().value()));
         }
         _ => println!("{:?}", signature),
     }
