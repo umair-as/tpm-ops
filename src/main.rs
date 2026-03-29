@@ -180,7 +180,8 @@ fn cmd_pcr(context: &mut TpmContext, index: u8, algo: &str) -> Result<()> {
     }
 
     let hash_algo = parse_hash_algo(algo)?;
-    let pcr_slot = PcrSlot::try_from(index as u32).context("Invalid PCR slot")?;
+    let pcr_slot =
+        PcrSlot::try_from(1u32 << index).context("Invalid PCR slot (bitmask conversion)")?;
 
     let pcr_selection = PcrSelectionListBuilder::new()
         .with_selection(hash_algo, &[pcr_slot])
@@ -267,7 +268,7 @@ fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
             None,
             None,
             SessionType::Hmac,
-            SymmetricDefinition::AES_128_CFB,
+            SymmetricDefinition::Null,
             HashingAlgorithm::Sha256,
         )
         .context("Failed to start auth session")?
