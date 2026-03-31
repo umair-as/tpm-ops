@@ -2,32 +2,36 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use log::info;
+use log::{debug, info};
 use std::str::FromStr;
 
 use tss_esapi::{
     attributes::ObjectAttributesBuilder,
-    constants::{PropertyTag, SessionType},
+    constants::PropertyTag,
     handles::KeyHandle,
     interface_types::{
         algorithm::{HashingAlgorithm, PublicAlgorithm},
         ecc::EccCurve,
         key_bits::RsaKeyBits,
         resource_handles::Hierarchy,
+        session_handles::AuthSession,
     },
     structures::{
         EccPoint, EccScheme, HashScheme, KeyDerivationFunctionScheme, MaxBuffer,
         PcrSelectionListBuilder, PcrSlot, PublicBuilder, PublicEccParametersBuilder,
         PublicKeyRsa, PublicRsaParametersBuilder, RsaExponent, RsaScheme, SignatureScheme,
-        SymmetricDefinition,
     },
     tcti_ldr::{DeviceConfig, TctiNameConf},
     Context as TpmContext,
 };
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_HASH: &str = env!("TPM_OPS_GIT_HASH");
+
 #[derive(Parser)]
 #[command(name = "tpm-ops")]
 #[command(about = "TPM 2.0 operations tool for Infineon SLB9672", long_about = None)]
+#[command(version = VERSION)]
 struct Cli {
     /// TCTI device path
     #[arg(short, long, default_value = "/dev/tpmrm0")]
@@ -41,6 +45,13 @@ struct Cli {
 enum Commands {
     /// Display TPM information and capabilities
     Info,
+
+    /// Run TPM self-test and report health status
+    Selftest {
+        /// Run full self-test (slower but more thorough)
+        #[arg(short, long)]
+        full: bool,
+    },
 
     /// Generate random bytes using TPM TRNG
     Random {
@@ -82,12 +93,20 @@ enum Commands {
 
     /// Run all tests
     Test,
+
+    /// Show version and build information
+    Version,
 }
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let cli = Cli::parse();
+
+    // Version doesn't need TPM access
+    if matches!(cli.command, Commands::Version) {
+        return cmd_version();
+    }
 
     let device_config =
         DeviceConfig::from_str(&cli.device).context("Invalid TCTI device path")?;
@@ -97,12 +116,57 @@ fn main() -> Result<()> {
 
     match cli.command {
         Commands::Info => cmd_info(&mut context),
+        Commands::Selftest { full } => cmd_selftest(&mut context, full),
         Commands::Random { bytes } => cmd_random(&mut context, bytes),
         Commands::Pcr { index, algo } => cmd_pcr(&mut context, index, &algo),
         Commands::Hash { data, algo } => cmd_hash(&mut context, &data, &algo),
         Commands::Sign { data, ecc } => cmd_sign(&mut context, &data, ecc),
         Commands::Test => cmd_test(&mut context),
+        Commands::Version => unreachable!(),
     }
+}
+
+// =============================================================================
+// RAII Guards for TPM Resource Management
+// =============================================================================
+
+/// RAII guard that flushes a transient TPM key handle on drop.
+struct KeyGuard<'a> {
+    context: &'a mut TpmContext,
+    handle: Option<KeyHandle>,
+}
+
+impl<'a> KeyGuard<'a> {
+    fn new(context: &'a mut TpmContext, handle: KeyHandle) -> Self {
+        Self {
+            context,
+            handle: Some(handle),
+        }
+    }
+
+    fn handle(&self) -> KeyHandle {
+        self.handle.expect("KeyGuard: handle already consumed (bug)")
+    }
+}
+
+impl Drop for KeyGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            if let Err(e) = self.context.flush_context(h.into()) {
+                debug!("KeyGuard: failed to flush key handle: {}", e);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Commands
+// =============================================================================
+
+fn cmd_version() -> Result<()> {
+    println!("tpm-ops {}", VERSION);
+    println!("git: {}", GIT_HASH);
+    Ok(())
 }
 
 fn get_property(context: &mut TpmContext, tag: PropertyTag) -> Result<Option<u32>> {
@@ -116,7 +180,9 @@ fn cmd_info(context: &mut TpmContext) -> Result<()> {
 
     // Manufacturer is the critical field — fail if unreadable
     let manufacturer = get_property(context, PropertyTag::Manufacturer)?
-        .ok_or_else(|| anyhow::anyhow!("TPM did not report manufacturer — device may be unresponsive"))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("TPM did not report manufacturer — device may be unresponsive")
+        })?;
 
     let mfr_bytes = manufacturer.to_be_bytes();
     let mfr_str: String = mfr_bytes
@@ -124,6 +190,7 @@ fn cmd_info(context: &mut TpmContext) -> Result<()> {
         .filter(|&&b| b != 0)
         .map(|&b| b as char)
         .collect();
+
     println!("Manufacturer: {} (0x{:08X})", mfr_str, manufacturer);
 
     // Vendor strings are optional — print what we can
@@ -141,6 +208,7 @@ fn cmd_info(context: &mut TpmContext) -> Result<()> {
         .filter(|&b| b != 0 && b.is_ascii())
         .map(|b| b as char)
         .collect::<String>();
+
     if !vendor_str.is_empty() {
         println!("Vendor: {}", vendor_str);
     }
@@ -154,6 +222,36 @@ fn cmd_info(context: &mut TpmContext) -> Result<()> {
     }
 
     println!("\nTPM is accessible and responding [OK]");
+    Ok(())
+}
+
+fn cmd_selftest(context: &mut TpmContext, full: bool) -> Result<()> {
+    info!("Running TPM self-test (full={})...", full);
+
+    context
+        .self_test(full)
+        .context("TPM self-test failed")?;
+
+    println!("TPM self-test: PASSED");
+    println!("  Mode: {}", if full { "full" } else { "incremental" });
+
+    match context.get_test_result() {
+        Ok((data, result)) => {
+            if result.is_ok() {
+                println!("  Result: OK");
+            } else {
+                println!("  Result: {:?}", result);
+            }
+            if !data.is_empty() {
+                println!("  Test data: {} bytes", data.len());
+            }
+        }
+        Err(e) => {
+            debug!("Could not read test result details: {}", e);
+        }
+    }
+
+    println!("\nTPM health check [OK]");
     Ok(())
 }
 
@@ -180,8 +278,10 @@ fn cmd_pcr(context: &mut TpmContext, index: u8, algo: &str) -> Result<()> {
     }
 
     let hash_algo = parse_hash_algo(algo)?;
-    let pcr_slot =
-        PcrSlot::try_from(1u32 << index).context("Invalid PCR slot (bitmask conversion)")?;
+    let pcr_mask = 1u32
+        .checked_shl(index as u32)
+        .ok_or_else(|| anyhow::anyhow!("Invalid PCR slot index shift"))?;
+    let pcr_slot = PcrSlot::try_from(pcr_mask).context("Invalid PCR slot")?;
 
     let pcr_selection = PcrSelectionListBuilder::new()
         .with_selection(hash_algo, &[pcr_slot])
@@ -234,48 +334,11 @@ fn cmd_hash(context: &mut TpmContext, data: &str, algo: &str) -> Result<()> {
     Ok(())
 }
 
-/// RAII guard that flushes a transient TPM key handle on drop
-struct KeyGuard<'a> {
-    context: &'a mut TpmContext,
-    handle: Option<KeyHandle>,
-}
-
-impl<'a> KeyGuard<'a> {
-    fn new(context: &'a mut TpmContext, handle: KeyHandle) -> Self {
-        Self {
-            context,
-            handle: Some(handle),
-        }
-    }
-
-    fn handle(&self) -> KeyHandle {
-        self.handle.expect("handle already taken")
-    }
-}
-
-impl Drop for KeyGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(h) = self.handle.take() {
-            let _ = self.context.flush_context(h.into());
-        }
-    }
-}
-
 fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
-    let session = context
-        .start_auth_session(
-            None,
-            None,
-            None,
-            SessionType::Hmac,
-            SymmetricDefinition::Null,
-            HashingAlgorithm::Sha256,
-        )
-        .context("Failed to start auth session")?
-        .ok_or_else(|| anyhow::anyhow!("Auth session creation returned None"))?;
+    cmd_sign_inner(context, data, use_ecc)
+}
 
-    context.set_sessions((Some(session), None, None));
-
+fn cmd_sign_inner(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
     info!(
         "Creating {} primary key in TPM...",
         if use_ecc { "ECC" } else { "RSA" }
@@ -295,7 +358,6 @@ fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
     let data_bytes = data.as_bytes();
     let buffer = MaxBuffer::try_from(data_bytes).context("Data too large")?;
 
-    // hash() returns both digest and the ticket needed for sign()
     let (digest, ticket) = guard
         .context
         .hash(buffer, HashingAlgorithm::Sha256, Hierarchy::Null)
@@ -313,9 +375,12 @@ fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
         }
     };
 
+    let key_handle = guard.handle();
     let signature = guard
         .context
-        .sign(guard.handle(), digest.clone(), scheme, ticket)
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.sign(key_handle, digest.clone(), scheme, ticket)
+        })
         .context("Failed to sign data")?;
 
     println!("\nData: {}", data);
@@ -335,7 +400,6 @@ fn cmd_sign(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
         _ => println!("{:?}", signature),
     }
 
-    // guard drops here, flushing the key handle
     println!("\nKey created, data signed, key flushed [OK]");
     Ok(())
 }
@@ -373,7 +437,9 @@ fn create_rsa_primary(context: &mut TpmContext) -> Result<KeyHandle> {
         .context("Failed to build public template")?;
 
     let result = context
-        .create_primary(Hierarchy::Owner, public, None, None, None, None)
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.create_primary(Hierarchy::Owner, public, None, None, None, None)
+        })
         .context("Failed to create RSA primary key")?;
 
     Ok(result.key_handle)
@@ -410,7 +476,9 @@ fn create_ecc_primary(context: &mut TpmContext) -> Result<KeyHandle> {
         .context("Failed to build public template")?;
 
     let result = context
-        .create_primary(Hierarchy::Owner, public, None, None, None, None)
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.create_primary(Hierarchy::Owner, public, None, None, None, None)
+        })
         .context("Failed to create ECC primary key")?;
 
     Ok(result.key_handle)
@@ -419,27 +487,31 @@ fn create_ecc_primary(context: &mut TpmContext) -> Result<KeyHandle> {
 fn cmd_test(context: &mut TpmContext) -> Result<()> {
     println!("=== TPM Test Suite ===\n");
 
-    println!("--- Test 1: TPM Info ---");
+    println!("--- Test 1: TPM Self-Test ---");
+    cmd_selftest(context, false)?;
+    println!();
+
+    println!("--- Test 2: TPM Info ---");
     cmd_info(context)?;
     println!();
 
-    println!("--- Test 2: Random Number Generation ---");
+    println!("--- Test 3: Random Number Generation ---");
     cmd_random(context, 32)?;
     println!();
 
-    println!("--- Test 3: PCR Read ---");
+    println!("--- Test 4: PCR Read ---");
     cmd_pcr(context, 0, "sha256")?;
     println!();
 
-    println!("--- Test 4: TPM Hash ---");
+    println!("--- Test 5: TPM Hash ---");
     cmd_hash(context, "Hello, TPM!", "sha256")?;
     println!();
 
-    println!("--- Test 5: RSA Signing ---");
+    println!("--- Test 6: RSA Signing ---");
     cmd_sign(context, "Test message for RSA signing", false)?;
     println!();
 
-    println!("--- Test 6: ECC Signing ---");
+    println!("--- Test 7: ECC Signing ---");
     cmd_sign(context, "Test message for ECC signing", true)?;
     println!();
 
