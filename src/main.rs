@@ -7,6 +7,7 @@ mod pem;
 mod sign;
 mod test;
 mod tpm;
+mod verify;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -39,6 +40,9 @@ fn main() -> Result<()> {
         Commands::Hash { data, algo } => commands::cmd_hash(&mut context, &data, &algo),
         Commands::Sign { data, ecc, key } => {
             sign::cmd_sign(&mut context, &data, ecc, key.as_deref())
+        }
+        Commands::Verify { data, key, sig } => {
+            verify::cmd_verify(&mut context, &data, &key, &sig)
         }
         Commands::Key(sub) => match sub {
             KeyCommands::Create { algo, persist } => {

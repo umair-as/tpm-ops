@@ -4,8 +4,9 @@ use tss_esapi::Context as TpmContext;
 
 use crate::commands::{cmd_hash, cmd_info, cmd_pcr, cmd_random, cmd_selftest};
 use crate::keys::{cmd_key_create, cmd_key_delete};
-use crate::sign::cmd_sign;
+use crate::sign::{cmd_sign, sign_with_persistent_key};
 use crate::tpm::persistent_to_esys;
+use crate::verify::cmd_verify;
 
 pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
     println!("=== TPM Test Suite ===\n");
@@ -42,6 +43,10 @@ pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
     cmd_test_persistent_key(context)?;
     println!();
 
+    println!("--- Test 9: Sign + Verify Roundtrip ---");
+    cmd_test_sign_verify(context)?;
+    println!();
+
     println!("=== All Tests Passed! ===");
     Ok(())
 }
@@ -67,5 +72,47 @@ fn cmd_test_persistent_key(context: &mut TpmContext) -> Result<()> {
     cmd_key_delete(context, test_handle)?;
 
     println!("\nPersistent key lifecycle [OK]");
+    Ok(())
+}
+
+/// Test sign + verify roundtrip with both RSA and ECC persistent keys.
+fn cmd_test_sign_verify(context: &mut TpmContext) -> Result<()> {
+    let test_data = "sign-verify-roundtrip";
+
+    for (algo, handle_str, handle_val) in [
+        ("rsa", "0x81000FFE", 0x81000FFEu32),
+        ("ecc", "0x81000FFD", 0x81000FFDu32),
+    ] {
+        // Clean up any stale key from a previous failed run.
+        if persistent_to_esys(context, handle_val).is_ok() {
+            cmd_key_delete(context, handle_str)?;
+        }
+
+        println!("  Creating test {} key...", algo.to_uppercase());
+        cmd_key_create(context, algo, handle_str)?;
+
+        println!("  Signing...");
+        let (is_ecc, _, sig_bytes) = sign_with_persistent_key(context, test_data, handle_str)?;
+        let sig_hex = hex::encode(&sig_bytes);
+
+        println!("  Verifying...");
+        cmd_verify(context, test_data, handle_str, &sig_hex)?;
+
+        // Verify that a tampered message is rejected.
+        println!("  Verifying tampered message (should fail)...");
+        match cmd_verify(context, "tampered-message", handle_str, &sig_hex) {
+            Err(_) => println!("  Tampered message correctly rejected [OK]"),
+            Ok(_) => anyhow::bail!("Tampered message was incorrectly accepted for {} key", algo),
+        }
+
+        let _ = is_ecc; // used implicitly via sig_bytes encoding
+
+        println!("  Deleting test key...");
+        cmd_key_delete(context, handle_str)?;
+
+        println!("  {} sign+verify [OK]", algo.to_uppercase());
+    }
+
+    println!("\nSign + Verify roundtrip [OK]");
     Ok(())
 }

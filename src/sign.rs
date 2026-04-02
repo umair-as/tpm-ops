@@ -33,8 +33,14 @@ pub(crate) fn cmd_sign(
     }
 }
 
-/// Sign with a persistent key. Detects RSA vs ECC from the key's public area.
-fn cmd_sign_persistent(context: &mut TpmContext, data: &str, handle_str: &str) -> Result<()> {
+/// Sign with a persistent key, returning (is_ecc, digest_hex, sig_bytes).
+/// For ECC sig_bytes = R||S (each component zero-padded to 32 bytes).
+/// For RSA sig_bytes = raw PKCS#1 signature.
+pub(crate) fn sign_with_persistent_key(
+    context: &mut TpmContext,
+    data: &str,
+    handle_str: &str,
+) -> Result<(bool, String, Vec<u8>)> {
     let handle_val = parse_handle(handle_str)?;
     let obj_handle = persistent_to_esys(context, handle_val)?;
     let key_handle = KeyHandle::from(obj_handle);
@@ -44,12 +50,6 @@ fn cmd_sign_persistent(context: &mut TpmContext, data: &str, handle_str: &str) -
         .context("Failed to read public area of persistent key")?;
 
     let is_ecc = matches!(public, Public::Ecc { .. });
-
-    info!(
-        "Signing with persistent {} key at 0x{:08X}...",
-        if is_ecc { "ECC" } else { "RSA" },
-        handle_val
-    );
 
     let data_bytes = data.as_bytes();
     let buffer = MaxBuffer::try_from(data_bytes).context("Data too large")?;
@@ -74,10 +74,54 @@ fn cmd_sign_persistent(context: &mut TpmContext, data: &str, handle_str: &str) -
         })
         .context("Failed to sign data")?;
 
+    let digest_hex = hex::encode(digest.value());
+
+    let sig_bytes = match &signature {
+        tss_esapi::structures::Signature::RsaSsa(s) => s.signature().value().to_vec(),
+        tss_esapi::structures::Signature::EcDsa(s) => {
+            // Pad each component to 32 bytes for P-256
+            let mut r = s.signature_r().value().to_vec();
+            let mut s_bytes = s.signature_s().value().to_vec();
+            // Left-pad with zeros if shorter than 32 bytes
+            while r.len() < 32 { r.insert(0, 0); }
+            while s_bytes.len() < 32 { s_bytes.insert(0, 0); }
+            let mut out = r;
+            out.extend_from_slice(&s_bytes);
+            out
+        }
+        other => anyhow::bail!("Unexpected signature type: {:?}", other),
+    };
+
+    Ok((is_ecc, digest_hex, sig_bytes))
+}
+
+/// Sign with a persistent key and print results. Detects RSA vs ECC from the key's public area.
+fn cmd_sign_persistent(context: &mut TpmContext, data: &str, handle_str: &str) -> Result<()> {
+    let handle_val = parse_handle(handle_str)?;
+
+    info!(
+        "Signing with persistent key at 0x{:08X}...",
+        handle_val
+    );
+
+    let (is_ecc, digest_hex, sig_bytes) = sign_with_persistent_key(context, data, handle_str)?;
+
     println!("\nData: {}", data);
-    println!("Digest (SHA256): {}", hex::encode(digest.value()));
-    println!("Key: 0x{:08X} (persistent)", handle_val);
-    print_signature(&signature);
+    println!("Digest (SHA256): {}", digest_hex);
+    println!("Key: 0x{:08X} (persistent, {})", handle_val, if is_ecc { "ECC" } else { "RSA" });
+
+    if is_ecc {
+        println!("\nSignature (ECDSA):");
+        println!("Algorithm: ECDSA");
+        println!("R: {}", hex::encode(&sig_bytes[..32]));
+        println!("S: {}", hex::encode(&sig_bytes[32..]));
+        println!("Sig (R||S): {}", hex::encode(&sig_bytes));
+    } else {
+        println!("\nSignature (RSA-SSA):");
+        println!("Algorithm: RSA-SSA");
+        println!("Signature: {}", hex::encode(&sig_bytes));
+    }
+
     println!("\nData signed with persistent key [OK]");
     Ok(())
 }

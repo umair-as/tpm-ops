@@ -69,6 +69,20 @@ pub(crate) enum Commands {
         key: Option<String>,
     },
 
+    /// Verify a signature using a persistent TPM key
+    Verify {
+        /// Data that was signed
+        data: String,
+
+        /// Persistent key handle (e.g. 0x81000001)
+        #[arg(short, long)]
+        key: String,
+
+        /// Signature hex: raw bytes for RSA; R||S concatenated for ECC (64 bytes / 128 hex chars)
+        #[arg(short, long)]
+        sig: String,
+    },
+
     /// Manage persistent TPM keys
     #[command(subcommand)]
     Key(KeyCommands),
