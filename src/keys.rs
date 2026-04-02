@@ -96,8 +96,9 @@ fn signing_key_template(algo: &str) -> Result<Public> {
 pub(crate) fn cmd_key_create(context: &mut TpmContext, algo: &str, persist_str: &str) -> Result<()> {
     let handle_val = parse_handle(persist_str)?;
 
-    if handle_val < 0x81000000 || handle_val > 0x81FFFFFF {
-        anyhow::bail!("Handle must be in persistent range 0x81000000..0x81FFFFFF");
+    // Owner hierarchy persistent range — platform range (0x81800000+) requires platform auth
+    if handle_val < 0x81000000 || handle_val > 0x817FFFFF {
+        anyhow::bail!("Handle must be in owner persistent range 0x81000000..0x817FFFFF");
     }
 
     if persistent_to_esys(context, handle_val).is_ok() {

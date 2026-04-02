@@ -48,8 +48,9 @@ pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
 
 /// Test persistent key create -> sign -> delete lifecycle.
 fn cmd_test_persistent_key(context: &mut TpmContext) -> Result<()> {
-    let test_handle = "0x81FFF001";
-    let test_handle_val: u32 = 0x81FFF001;
+    // Use a handle in the owner persistent range (0x81000000..0x817FFFFF)
+    let test_handle = "0x81000FFF";
+    let test_handle_val: u32 = 0x81000FFF;
 
     if persistent_to_esys(context, test_handle_val).is_ok() {
         info!("Cleaning up stale test key...");
