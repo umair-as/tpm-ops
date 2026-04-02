@@ -5,13 +5,17 @@ use tss_esapi::{
     handles::{KeyHandle, ObjectHandle, PersistentTpmHandle, TpmHandle},
     interface_types::{
         algorithm::HashingAlgorithm,
+        dynamic_handles::Persistent,
         key_bits::RsaKeyBits,
-        resource_handles::Hierarchy,
+        resource_handles::{Hierarchy, Provision},
         session_handles::AuthSession,
     },
     structures::{RsaExponent, SymmetricDefinitionObject},
     Context as TpmContext,
 };
+
+/// Reserved handle for the persistent SRK. Never exposed to users as a signing key slot.
+pub(crate) const PERSISTENT_SRK_HANDLE: u32 = 0x81000000;
 
 /// Parse a hex handle string like "0x81000001" into a u32.
 pub(crate) fn parse_handle(s: &str) -> Result<u32> {
@@ -66,11 +70,19 @@ impl Drop for KeyGuard<'_> {
     }
 }
 
-/// Create an SRK (Storage Root Key) under the owner hierarchy.
-/// Standard TCG template: RSA-2048, restricted, decrypt, AES-128-CFB inner symmetric.
-/// Returns a transient handle — caller must flush when done.
+/// Return the persistent SRK handle, creating and persisting it on first call.
+///
+/// The SRK lives at PERSISTENT_SRK_HANDLE (0x81000000) permanently.
+/// Subsequent calls skip the ~19s RSA-2048 keygen and just load the existing handle.
+/// Caller must NOT flush the returned handle — it is a persistent object.
 pub(crate) fn create_srk(context: &mut TpmContext) -> Result<KeyHandle> {
-    info!("Creating SRK (Storage Root Key)...");
+    // Fast path: SRK already persisted from a previous run.
+    if let Ok(obj_handle) = persistent_to_esys(context, PERSISTENT_SRK_HANDLE) {
+        debug!("Using existing persistent SRK at 0x{:08X}", PERSISTENT_SRK_HANDLE);
+        return Ok(KeyHandle::from(obj_handle));
+    }
+
+    info!("Creating SRK (Storage Root Key) — first-time setup, this takes ~20s...");
 
     let srk_public = tss_esapi::utils::create_restricted_decryption_rsa_public(
         SymmetricDefinitionObject::AES_128_CFB,
@@ -85,6 +97,25 @@ pub(crate) fn create_srk(context: &mut TpmContext) -> Result<KeyHandle> {
         })
         .context("Failed to create SRK")?;
 
-    debug!("SRK created: {:?}", result.key_handle);
-    Ok(result.key_handle)
+    let transient = result.key_handle;
+
+    // Persist at the reserved SRK slot.
+    let persistent_tpm_handle =
+        PersistentTpmHandle::new(PERSISTENT_SRK_HANDLE).context("Invalid SRK handle")?;
+    let persistent = Persistent::Persistent(persistent_tpm_handle);
+    context
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.evict_control(Provision::Owner, transient.into(), persistent)
+        })
+        .context("Failed to persist SRK")?;
+
+    context
+        .flush_context(transient.into())
+        .context("Failed to flush transient SRK after persisting")?;
+
+    info!("SRK persisted at 0x{:08X} [OK]", PERSISTENT_SRK_HANDLE);
+
+    let obj_handle = persistent_to_esys(context, PERSISTENT_SRK_HANDLE)
+        .context("Failed to load newly persisted SRK")?;
+    Ok(KeyHandle::from(obj_handle))
 }

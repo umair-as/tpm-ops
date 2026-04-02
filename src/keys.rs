@@ -23,7 +23,7 @@ use tss_esapi::{
 };
 
 use crate::pem::{der_to_pem, encode_ec_pubkey_der, encode_rsa_pubkey_der};
-use crate::tpm::{create_srk, parse_handle, persistent_to_esys};
+use crate::tpm::{create_srk, parse_handle, persistent_to_esys, PERSISTENT_SRK_HANDLE};
 
 /// Build a public template for an unrestricted signing child key.
 fn signing_key_template(algo: &str) -> Result<Public> {
@@ -96,9 +96,13 @@ fn signing_key_template(algo: &str) -> Result<Public> {
 pub(crate) fn cmd_key_create(context: &mut TpmContext, algo: &str, persist_str: &str) -> Result<()> {
     let handle_val = parse_handle(persist_str)?;
 
-    // Owner hierarchy persistent range — platform range (0x81800000+) requires platform auth
-    if handle_val < 0x81000000 || handle_val > 0x817FFFFF {
-        anyhow::bail!("Handle must be in owner persistent range 0x81000000..0x817FFFFF");
+    // Owner hierarchy persistent range — platform range (0x81800000+) requires platform auth.
+    // 0x81000000 is reserved for the persistent SRK — reject it.
+    if handle_val <= PERSISTENT_SRK_HANDLE || handle_val > 0x817FFFFF {
+        anyhow::bail!(
+            "Handle must be in owner persistent range 0x81000001..0x817FFFFF \
+             (0x81000000 is reserved for the SRK)"
+        );
     }
 
     if persistent_to_esys(context, handle_val).is_ok() {
@@ -129,8 +133,7 @@ pub(crate) fn cmd_key_create(context: &mut TpmContext, algo: &str, persist_str: 
         })
         .context("Failed to load child key")?;
 
-    context.flush_context(srk_handle.into())
-        .context("Failed to flush SRK")?;
+    // SRK is persistent — do not flush it.
 
     let persistent_tpm_handle =
         PersistentTpmHandle::new(handle_val).context("Invalid persistent handle")?;
@@ -216,9 +219,14 @@ pub(crate) fn cmd_key_list(context: &mut TpmContext) -> Result<()> {
                                 } else {
                                     "unrestricted"
                                 };
+                                let srk_note = if handle_val == PERSISTENT_SRK_HANDLE {
+                                    "  (SRK)"
+                                } else {
+                                    ""
+                                };
                                 println!(
-                                    "  0x{:08X}  {}  {}  {}",
-                                    handle_val, algo, restricted, usage
+                                    "  0x{:08X}  {}  {}  {}{}",
+                                    handle_val, algo, restricted, usage, srk_note
                                 );
                             }
                             Err(e) => {
@@ -252,6 +260,14 @@ pub(crate) fn cmd_key_list(context: &mut TpmContext) -> Result<()> {
 /// Delete a persistent key by evicting it from the TPM.
 pub(crate) fn cmd_key_delete(context: &mut TpmContext, handle_str: &str) -> Result<()> {
     let handle_val = parse_handle(handle_str)?;
+
+    if handle_val == PERSISTENT_SRK_HANDLE {
+        anyhow::bail!(
+            "0x{:08X} is the persistent SRK — refusing to delete it. \
+             Use 'tpm-ops key delete-srk' if you really need to reset it.",
+            PERSISTENT_SRK_HANDLE
+        );
+    }
 
     info!("Deleting persistent key at 0x{:08X}...", handle_val);
 
