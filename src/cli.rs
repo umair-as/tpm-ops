@@ -83,6 +83,31 @@ pub(crate) enum Commands {
         sig: String,
     },
 
+    /// Seal data to current PCR state and save sealed blob to disk
+    Seal {
+        /// Data to seal
+        data: String,
+
+        /// PCR list (comma-separated, SHA-256 bank), e.g. 0,7
+        #[arg(short, long)]
+        pcrs: String,
+
+        /// Output file path for sealed blob
+        #[arg(short, long)]
+        out: String,
+    },
+
+    /// Unseal data from a sealed blob if PCR policy is satisfied
+    Unseal {
+        /// Input sealed blob file path
+        #[arg(short = 'i', long = "in", alias = "input")]
+        input: String,
+
+        /// PCR list (comma-separated, SHA-256 bank), e.g. 0,7
+        #[arg(short, long)]
+        pcrs: String,
+    },
+
     /// Manage persistent TPM keys
     #[command(subcommand)]
     Key(KeyCommands),

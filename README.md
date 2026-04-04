@@ -10,6 +10,10 @@ Rust CLI tool for TPM 2.0 operations targeting the Infineon SLB9672 on Raspberry
 - **pcr** — Read PCR register values (SHA-1, SHA-256, SHA-384)
 - **hash** — Compute hashes using the TPM engine
 - **sign** — Create ephemeral RSA-2048 or ECC P-256 keys and sign data
+- **verify** — Verify signatures using persistent TPM keys
+- **key** — Persistent key management (create/list/delete/export-pub)
+- **seal** — Seal small secrets to PCR policy and save sealed blobs
+- **unseal** — Unseal blobs when PCR policy is satisfied
 - **test** — Run all operations as a validation suite
 - **version** — Show tool version and embedded git revision
 
@@ -58,6 +62,10 @@ Commands:
   pcr       Read PCR values
   hash      Hash data using TPM
   sign      Create a key pair in TPM and sign data
+  verify    Verify a signature using a persistent TPM key
+  seal      Seal data to current PCR state and save sealed blob
+  unseal    Unseal data from a sealed blob if PCR policy is satisfied
+  key       Manage persistent TPM keys
   test      Run all operations as a validation suite
   version   Show version and build information
 ```
@@ -73,6 +81,11 @@ tpm-ops pcr -i 0                # Read PCR[0] SHA-256
 tpm-ops hash "hello"            # TPM-computed SHA-256
 tpm-ops sign "test"             # RSA-2048 sign
 tpm-ops sign "test" --ecc       # ECC P-256 sign
+tpm-ops key create --algo rsa --persist 0x81000001
+tpm-ops sign "test" --key 0x81000001
+tpm-ops verify "test" --key 0x81000001 --sig <hex>
+tpm-ops seal "bootstrap-secret" --pcrs 0,7 --out sealed.blob
+tpm-ops unseal --in sealed.blob --pcrs 0,7
 tpm-ops version                 # Binary version + git hash
 tpm-ops test                    # Run full validation suite
 ```

@@ -4,6 +4,7 @@ use tss_esapi::Context as TpmContext;
 
 use crate::commands::{cmd_hash, cmd_info, cmd_pcr, cmd_random, cmd_selftest};
 use crate::keys::{cmd_key_create, cmd_key_delete};
+use crate::seal::{cmd_seal, unseal_from_file};
 use crate::sign::{cmd_sign, sign_with_persistent_key};
 use crate::tpm::persistent_to_esys;
 use crate::verify::cmd_verify;
@@ -45,6 +46,10 @@ pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
 
     println!("--- Test 9: Sign + Verify Roundtrip ---");
     cmd_test_sign_verify(context)?;
+    println!();
+
+    println!("--- Test 10: Seal + Unseal Roundtrip ---");
+    cmd_test_seal_unseal(context)?;
     println!();
 
     println!("=== All Tests Passed! ===");
@@ -114,5 +119,31 @@ fn cmd_test_sign_verify(context: &mut TpmContext) -> Result<()> {
     }
 
     println!("\nSign + Verify roundtrip [OK]");
+    Ok(())
+}
+
+/// Test sealing and unsealing data against a PCR policy.
+fn cmd_test_seal_unseal(context: &mut TpmContext) -> Result<()> {
+    let path = format!("/tmp/tpm-ops-sealed-test-{}.blob", std::process::id());
+    let payload = "sealed-roundtrip-test";
+
+    println!("  Sealing test payload...");
+    cmd_seal(context, payload, "0", &path)?;
+
+    println!("  Unsealing with matching PCR policy...");
+    let unsealed = unseal_from_file(context, &path, "0")?;
+    if unsealed != payload.as_bytes() {
+        anyhow::bail!("Unsealed payload mismatch");
+    }
+    println!("  Roundtrip payload match [OK]");
+
+    println!("  Unsealing with wrong PCR selection (should fail)...");
+    match unseal_from_file(context, &path, "1") {
+        Err(_) => println!("  Wrong PCR selection correctly rejected [OK]"),
+        Ok(_) => anyhow::bail!("Expected unseal to fail with wrong PCR selection"),
+    }
+
+    let _ = std::fs::remove_file(&path);
+    println!("\nSeal + Unseal roundtrip [OK]");
     Ok(())
 }
