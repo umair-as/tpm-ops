@@ -7,7 +7,7 @@ use crate::keys::{cmd_key_create, cmd_key_delete};
 use crate::quote::{cmd_quote, cmd_quote_verify};
 use crate::seal::{cmd_seal, unseal_from_file};
 use crate::sign::{cmd_sign, sign_with_persistent_key};
-use crate::tpm::persistent_to_esys;
+use crate::tpm::persistent_handle_exists;
 use crate::verify::cmd_verify;
 
 pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
@@ -67,7 +67,7 @@ fn cmd_test_persistent_key(context: &mut TpmContext) -> Result<()> {
     let test_handle = "0x81000FFF";
     let test_handle_val: u32 = 0x81000FFF;
 
-    if persistent_to_esys(context, test_handle_val).is_ok() {
+    if persistent_handle_exists(context, test_handle_val)? {
         info!("Cleaning up stale test key...");
         cmd_key_delete(context, test_handle)?;
     }
@@ -94,7 +94,7 @@ fn cmd_test_sign_verify(context: &mut TpmContext) -> Result<()> {
         ("ecc", "0x81000FFD", 0x81000FFDu32),
     ] {
         // Clean up any stale key from a previous failed run.
-        if persistent_to_esys(context, handle_val).is_ok() {
+        if persistent_handle_exists(context, handle_val)? {
             cmd_key_delete(context, handle_str)?;
         }
 
