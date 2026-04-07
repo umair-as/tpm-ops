@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use log::{debug, info};
 
 use tss_esapi::{
+    constants::CapabilityType,
     handles::{KeyHandle, ObjectHandle, PersistentTpmHandle, TpmHandle},
     interface_types::{
         algorithm::HashingAlgorithm,
@@ -10,7 +11,7 @@ use tss_esapi::{
         resource_handles::{Hierarchy, Provision},
         session_handles::AuthSession,
     },
-    structures::{RsaExponent, SymmetricDefinitionObject},
+    structures::{CapabilityData, RsaExponent, SymmetricDefinitionObject},
     Context as TpmContext,
 };
 
@@ -31,6 +32,29 @@ pub(crate) fn persistent_to_esys(context: &mut TpmContext, handle_val: u32) -> R
         .tr_from_tpm_public(TpmHandle::Persistent(persistent_handle))
         .context("Failed to load persistent handle — key may not exist")
 }
+
+/// Check whether a persistent handle exists without issuing a ReadPublic command.
+///
+/// Uses GetCapability(Handles) instead of tr_from_tpm_public so that probing
+/// an absent handle does not trigger tss2 C-library error logs.
+pub(crate) fn persistent_handle_exists(context: &mut TpmContext, handle_val: u32) -> Result<bool> {
+    // GetCapability returns handles >= property, up to count. Ask for 1 starting
+    // at our exact handle — if it exists it will be the first (and only) result.
+    let (cap, _more) = context
+        .get_capability(CapabilityType::Handles, handle_val, 1)
+        .context("Failed to query persistent handles")?;
+
+    if let CapabilityData::Handles(handles) = cap {
+        for &h in handles.as_ref() {
+            let v: u32 = h.into();
+            if v == handle_val {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 
 pub(crate) fn parse_hash_algo(algo: &str) -> Result<HashingAlgorithm> {
     match algo.to_lowercase().as_str() {
@@ -77,7 +101,8 @@ impl Drop for KeyGuard<'_> {
 /// Caller must NOT flush the returned handle — it is a persistent object.
 pub(crate) fn create_srk(context: &mut TpmContext) -> Result<KeyHandle> {
     // Fast path: SRK already persisted from a previous run.
-    if let Ok(obj_handle) = persistent_to_esys(context, PERSISTENT_SRK_HANDLE) {
+    if persistent_handle_exists(context, PERSISTENT_SRK_HANDLE)? {
+        let obj_handle = persistent_to_esys(context, PERSISTENT_SRK_HANDLE)?;
         debug!("Using existing persistent SRK at 0x{:08X}", PERSISTENT_SRK_HANDLE);
         return Ok(KeyHandle::from(obj_handle));
     }
