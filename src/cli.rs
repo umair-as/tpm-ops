@@ -108,6 +108,31 @@ pub(crate) enum Commands {
         pcrs: String,
     },
 
+    /// Generate a TPM quote (TPM2_Quote) over selected PCRs
+    Quote {
+        /// PCR list (comma-separated, SHA-256 bank), e.g. 0,7
+        #[arg(short, long, default_value = "0,7")]
+        pcrs: String,
+
+        /// Nonce as hex string (auto-generated if omitted)
+        #[arg(short, long)]
+        nonce: Option<String>,
+
+        /// Signing algorithm for the ephemeral AK: rsa or ecc
+        #[arg(short, long, default_value = "rsa")]
+        algo: String,
+
+        /// Output file path for the quote blob (prints to stdout if omitted)
+        #[arg(short, long)]
+        out: Option<String>,
+    },
+
+    /// Verify a quote blob produced by the quote command
+    QuoteVerify {
+        /// Path to the quote blob file
+        input: String,
+    },
+
     /// Manage persistent TPM keys
     #[command(subcommand)]
     Key(KeyCommands),

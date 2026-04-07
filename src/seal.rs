@@ -11,14 +11,13 @@ use tss_esapi::{
         session_handles::{AuthSession, PolicySession},
     },
     structures::{
-        Digest, KeyedHashScheme, PcrSelectionList, PcrSelectionListBuilder, PcrSlot, Public,
-        PublicBuffer, PublicBuilder, PublicKeyedHashParameters, SensitiveData, SymmetricDefinition,
+        Digest, KeyedHashScheme, PcrSelectionList, Public, PublicBuffer, PublicBuilder,
+        PublicKeyedHashParameters, SensitiveData, SymmetricDefinition,
     },
     Context as TpmContext,
 };
 
-use crate::tpm::create_srk;
-use crate::tpm::KeyGuard;
+use crate::tpm::{create_srk, parse_pcr_indices, pcr_selection_sha256, KeyGuard};
 
 const SEALED_BLOB_MAGIC: &str = "TPM_OPS_SEALED_V1";
 
@@ -82,53 +81,6 @@ impl SealedBlob {
             public = self.public_hex,
         )
     }
-}
-
-fn parse_pcr_indices(pcrs: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-
-    for part in pcrs.split(',') {
-        let token = part.trim();
-        if token.is_empty() {
-            continue;
-        }
-
-        let idx: u8 = token
-            .parse()
-            .with_context(|| format!("Invalid PCR index '{}'", token))?;
-
-        if idx > 23 {
-            anyhow::bail!("PCR index out of range: {} (expected 0..23)", idx);
-        }
-
-        if !out.contains(&idx) {
-            out.push(idx);
-        }
-    }
-
-    if out.is_empty() {
-        anyhow::bail!("At least one PCR must be provided (example: 0,7)");
-    }
-
-    out.sort_unstable();
-    Ok(out)
-}
-
-fn pcr_selection_sha256(indices: &[u8]) -> Result<PcrSelectionList> {
-    let mut slots = Vec::with_capacity(indices.len());
-    for &idx in indices {
-        let pcr_mask = 1u32
-            .checked_shl(idx as u32)
-            .ok_or_else(|| anyhow::anyhow!("Invalid PCR shift for index {}", idx))?;
-        let slot = PcrSlot::try_from(pcr_mask)
-            .with_context(|| format!("Invalid PCR slot {}", idx))?;
-        slots.push(slot);
-    }
-
-    PcrSelectionListBuilder::new()
-        .with_selection(HashingAlgorithm::Sha256, &slots)
-        .build()
-        .context("Failed to build PCR selection")
 }
 
 fn policy_digest_for_current_pcr(context: &mut TpmContext, pcr_selection: PcrSelectionList) -> Result<Digest> {

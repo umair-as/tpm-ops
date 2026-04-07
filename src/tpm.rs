@@ -11,7 +11,10 @@ use tss_esapi::{
         resource_handles::{Hierarchy, Provision},
         session_handles::AuthSession,
     },
-    structures::{CapabilityData, RsaExponent, SymmetricDefinitionObject},
+    structures::{
+        CapabilityData, PcrSelectionList, PcrSelectionListBuilder, PcrSlot, RsaExponent,
+        SymmetricDefinitionObject,
+    },
     Context as TpmContext,
 };
 
@@ -143,4 +146,46 @@ pub(crate) fn create_srk(context: &mut TpmContext) -> Result<KeyHandle> {
     let obj_handle = persistent_to_esys(context, PERSISTENT_SRK_HANDLE)
         .context("Failed to load newly persisted SRK")?;
     Ok(KeyHandle::from(obj_handle))
+}
+
+/// Parse a comma-separated list of PCR indices (e.g. "0,7") into a sorted, deduplicated Vec<u8>.
+pub(crate) fn parse_pcr_indices(pcrs: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for part in pcrs.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let idx: u8 = token
+            .parse()
+            .with_context(|| format!("Invalid PCR index '{}'", token))?;
+        if idx > 23 {
+            anyhow::bail!("PCR index out of range: {} (expected 0..23)", idx);
+        }
+        if !out.contains(&idx) {
+            out.push(idx);
+        }
+    }
+    if out.is_empty() {
+        anyhow::bail!("At least one PCR must be provided (example: 0,7)");
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// Build a SHA-256 PCR selection list from a slice of PCR indices.
+pub(crate) fn pcr_selection_sha256(indices: &[u8]) -> Result<PcrSelectionList> {
+    let mut slots = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        let pcr_mask = 1u32
+            .checked_shl(idx as u32)
+            .ok_or_else(|| anyhow::anyhow!("Invalid PCR shift for index {}", idx))?;
+        let slot = PcrSlot::try_from(pcr_mask)
+            .with_context(|| format!("Invalid PCR slot {}", idx))?;
+        slots.push(slot);
+    }
+    PcrSelectionListBuilder::new()
+        .with_selection(HashingAlgorithm::Sha256, &slots)
+        .build()
+        .context("Failed to build PCR selection")
 }

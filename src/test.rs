@@ -4,6 +4,7 @@ use tss_esapi::Context as TpmContext;
 
 use crate::commands::{cmd_hash, cmd_info, cmd_pcr, cmd_random, cmd_selftest};
 use crate::keys::{cmd_key_create, cmd_key_delete};
+use crate::quote::{cmd_quote, cmd_quote_verify};
 use crate::seal::{cmd_seal, unseal_from_file};
 use crate::sign::{cmd_sign, sign_with_persistent_key};
 use crate::tpm::persistent_to_esys;
@@ -50,6 +51,10 @@ pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
 
     println!("--- Test 10: Seal + Unseal Roundtrip ---");
     cmd_test_seal_unseal(context)?;
+    println!();
+
+    println!("--- Test 11: TPM Quote + Verify ---");
+    cmd_test_quote(context)?;
     println!();
 
     println!("=== All Tests Passed! ===");
@@ -145,5 +150,20 @@ fn cmd_test_seal_unseal(context: &mut TpmContext) -> Result<()> {
 
     let _ = std::fs::remove_file(&path);
     println!("\nSeal + Unseal roundtrip [OK]");
+    Ok(())
+}
+
+/// Test TPM2_Quote + verify roundtrip with an auto-generated nonce.
+fn cmd_test_quote(context: &mut TpmContext) -> Result<()> {
+    let path = format!("/tmp/tpm-ops-quote-test-{}.blob", std::process::id());
+
+    println!("  Generating RSA quote over PCR 0...");
+    cmd_quote(context, "0", None, "rsa", Some(&path))?;
+
+    println!("  Verifying quote...");
+    cmd_quote_verify(context, &path)?;
+
+    let _ = std::fs::remove_file(&path);
+    println!("\nTPM Quote + Verify roundtrip [OK]");
     Ok(())
 }
