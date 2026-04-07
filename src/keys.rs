@@ -23,7 +23,7 @@ use tss_esapi::{
 };
 
 use crate::pem::{der_to_pem, encode_ec_pubkey_der, encode_rsa_pubkey_der};
-use crate::tpm::{create_srk, parse_handle, persistent_to_esys, PERSISTENT_SRK_HANDLE};
+use crate::tpm::{create_srk, parse_handle, persistent_handle_exists, persistent_to_esys, PERSISTENT_SRK_HANDLE};
 
 /// Build a public template for an unrestricted signing child key.
 fn signing_key_template(algo: &str) -> Result<Public> {
@@ -105,7 +105,7 @@ pub(crate) fn cmd_key_create(context: &mut TpmContext, algo: &str, persist_str: 
         );
     }
 
-    if persistent_to_esys(context, handle_val).is_ok() {
+    if persistent_handle_exists(context, handle_val)? {
         anyhow::bail!("Handle 0x{:08X} is already in use — delete it first", handle_val);
     }
 

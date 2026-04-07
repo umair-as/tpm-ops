@@ -4,6 +4,8 @@ mod cli;
 mod commands;
 mod keys;
 mod pem;
+mod quote;
+mod seal;
 mod sign;
 mod test;
 mod tpm;
@@ -44,6 +46,12 @@ fn main() -> Result<()> {
         Commands::Verify { data, key, sig } => {
             verify::cmd_verify(&mut context, &data, &key, &sig)
         }
+        Commands::Seal { data, pcrs, out } => seal::cmd_seal(&mut context, &data, &pcrs, &out),
+        Commands::Unseal { input, pcrs } => seal::cmd_unseal(&mut context, &input, &pcrs),
+        Commands::Quote { pcrs, nonce, algo, out } => {
+            quote::cmd_quote(&mut context, &pcrs, nonce.as_deref(), &algo, out.as_deref())
+        }
+        Commands::QuoteVerify { input } => quote::cmd_quote_verify(&mut context, &input),
         Commands::Key(sub) => match sub {
             KeyCommands::Create { algo, persist } => {
                 keys::cmd_key_create(&mut context, &algo, &persist)

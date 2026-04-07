@@ -83,6 +83,56 @@ pub(crate) enum Commands {
         sig: String,
     },
 
+    /// Seal data to current PCR state and save sealed blob to disk
+    Seal {
+        /// Data to seal
+        data: String,
+
+        /// PCR list (comma-separated, SHA-256 bank), e.g. 0,7
+        #[arg(short, long)]
+        pcrs: String,
+
+        /// Output file path for sealed blob
+        #[arg(short, long)]
+        out: String,
+    },
+
+    /// Unseal data from a sealed blob if PCR policy is satisfied
+    Unseal {
+        /// Input sealed blob file path
+        #[arg(short = 'i', long = "in", alias = "input")]
+        input: String,
+
+        /// PCR list (comma-separated, SHA-256 bank), e.g. 0,7
+        #[arg(short, long)]
+        pcrs: String,
+    },
+
+    /// Generate a TPM quote (TPM2_Quote) over selected PCRs
+    Quote {
+        /// PCR list (comma-separated, SHA-256 bank), e.g. 0,7
+        #[arg(short, long, default_value = "0,7")]
+        pcrs: String,
+
+        /// Nonce as hex string (auto-generated if omitted)
+        #[arg(short, long)]
+        nonce: Option<String>,
+
+        /// Signing algorithm for the ephemeral AK: rsa or ecc
+        #[arg(short, long, default_value = "rsa")]
+        algo: String,
+
+        /// Output file path for the quote blob (prints to stdout if omitted)
+        #[arg(short, long)]
+        out: Option<String>,
+    },
+
+    /// Verify a quote blob produced by the quote command
+    QuoteVerify {
+        /// Path to the quote blob file
+        input: String,
+    },
+
     /// Manage persistent TPM keys
     #[command(subcommand)]
     Key(KeyCommands),

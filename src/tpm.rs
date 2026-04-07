@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use log::{debug, info};
 
 use tss_esapi::{
+    constants::CapabilityType,
     handles::{KeyHandle, ObjectHandle, PersistentTpmHandle, TpmHandle},
     interface_types::{
         algorithm::HashingAlgorithm,
@@ -10,7 +11,10 @@ use tss_esapi::{
         resource_handles::{Hierarchy, Provision},
         session_handles::AuthSession,
     },
-    structures::{RsaExponent, SymmetricDefinitionObject},
+    structures::{
+        CapabilityData, PcrSelectionList, PcrSelectionListBuilder, PcrSlot, RsaExponent,
+        SymmetricDefinitionObject,
+    },
     Context as TpmContext,
 };
 
@@ -31,6 +35,29 @@ pub(crate) fn persistent_to_esys(context: &mut TpmContext, handle_val: u32) -> R
         .tr_from_tpm_public(TpmHandle::Persistent(persistent_handle))
         .context("Failed to load persistent handle — key may not exist")
 }
+
+/// Check whether a persistent handle exists without issuing a ReadPublic command.
+///
+/// Uses GetCapability(Handles) instead of tr_from_tpm_public so that probing
+/// an absent handle does not trigger tss2 C-library error logs.
+pub(crate) fn persistent_handle_exists(context: &mut TpmContext, handle_val: u32) -> Result<bool> {
+    // GetCapability returns handles >= property, up to count. Ask for 1 starting
+    // at our exact handle — if it exists it will be the first (and only) result.
+    let (cap, _more) = context
+        .get_capability(CapabilityType::Handles, handle_val, 1)
+        .context("Failed to query persistent handles")?;
+
+    if let CapabilityData::Handles(handles) = cap {
+        for &h in handles.as_ref() {
+            let v: u32 = h.into();
+            if v == handle_val {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 
 pub(crate) fn parse_hash_algo(algo: &str) -> Result<HashingAlgorithm> {
     match algo.to_lowercase().as_str() {
@@ -77,7 +104,8 @@ impl Drop for KeyGuard<'_> {
 /// Caller must NOT flush the returned handle — it is a persistent object.
 pub(crate) fn create_srk(context: &mut TpmContext) -> Result<KeyHandle> {
     // Fast path: SRK already persisted from a previous run.
-    if let Ok(obj_handle) = persistent_to_esys(context, PERSISTENT_SRK_HANDLE) {
+    if persistent_handle_exists(context, PERSISTENT_SRK_HANDLE)? {
+        let obj_handle = persistent_to_esys(context, PERSISTENT_SRK_HANDLE)?;
         debug!("Using existing persistent SRK at 0x{:08X}", PERSISTENT_SRK_HANDLE);
         return Ok(KeyHandle::from(obj_handle));
     }
@@ -118,4 +146,46 @@ pub(crate) fn create_srk(context: &mut TpmContext) -> Result<KeyHandle> {
     let obj_handle = persistent_to_esys(context, PERSISTENT_SRK_HANDLE)
         .context("Failed to load newly persisted SRK")?;
     Ok(KeyHandle::from(obj_handle))
+}
+
+/// Parse a comma-separated list of PCR indices (e.g. "0,7") into a sorted, deduplicated Vec<u8>.
+pub(crate) fn parse_pcr_indices(pcrs: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for part in pcrs.split(',') {
+        let token = part.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let idx: u8 = token
+            .parse()
+            .with_context(|| format!("Invalid PCR index '{}'", token))?;
+        if idx > 23 {
+            anyhow::bail!("PCR index out of range: {} (expected 0..23)", idx);
+        }
+        if !out.contains(&idx) {
+            out.push(idx);
+        }
+    }
+    if out.is_empty() {
+        anyhow::bail!("At least one PCR must be provided (example: 0,7)");
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// Build a SHA-256 PCR selection list from a slice of PCR indices.
+pub(crate) fn pcr_selection_sha256(indices: &[u8]) -> Result<PcrSelectionList> {
+    let mut slots = Vec::with_capacity(indices.len());
+    for &idx in indices {
+        let pcr_mask = 1u32
+            .checked_shl(idx as u32)
+            .ok_or_else(|| anyhow::anyhow!("Invalid PCR shift for index {}", idx))?;
+        let slot = PcrSlot::try_from(pcr_mask)
+            .with_context(|| format!("Invalid PCR slot {}", idx))?;
+        slots.push(slot);
+    }
+    PcrSelectionListBuilder::new()
+        .with_selection(HashingAlgorithm::Sha256, &slots)
+        .build()
+        .context("Failed to build PCR selection")
 }
