@@ -155,7 +155,8 @@ pub(crate) fn cmd_pcr(context: &mut TpmContext, index: u8, algo: &str) -> Result
 pub(crate) fn cmd_hash(context: &mut TpmContext, data: &str, algo: &str) -> Result<()> {
     let hash_algo = parse_hash_algo(algo)?;
 
-    let data_bytes = if data.chars().all(|c| c.is_ascii_hexdigit()) && data.len().is_multiple_of(2) {
+    let data_bytes = if data.chars().all(|c| c.is_ascii_hexdigit()) && data.len().is_multiple_of(2)
+    {
         hex::decode(data).unwrap_or_else(|_| data.as_bytes().to_vec())
     } else {
         data.as_bytes().to_vec()
