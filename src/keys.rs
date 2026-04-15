@@ -23,7 +23,9 @@ use tss_esapi::{
 };
 
 use crate::pem::{der_to_pem, encode_ec_pubkey_der, encode_rsa_pubkey_der};
-use crate::tpm::{create_srk, parse_handle, persistent_handle_exists, persistent_to_esys, PERSISTENT_SRK_HANDLE};
+use crate::tpm::{
+    create_srk, parse_handle, persistent_handle_exists, persistent_to_esys, PERSISTENT_SRK_HANDLE,
+};
 
 /// Build a public template for an unrestricted signing child key.
 fn signing_key_template(algo: &str) -> Result<Public> {
@@ -93,7 +95,11 @@ fn signing_key_template(algo: &str) -> Result<Public> {
 }
 
 /// Create a child signing key under the SRK and persist it.
-pub(crate) fn cmd_key_create(context: &mut TpmContext, algo: &str, persist_str: &str) -> Result<()> {
+pub(crate) fn cmd_key_create(
+    context: &mut TpmContext,
+    algo: &str,
+    persist_str: &str,
+) -> Result<()> {
     let handle_val = parse_handle(persist_str)?;
 
     // Owner hierarchy persistent range — platform range (0x81800000+) requires platform auth.
@@ -106,7 +112,10 @@ pub(crate) fn cmd_key_create(context: &mut TpmContext, algo: &str, persist_str: 
     }
 
     if persistent_handle_exists(context, handle_val)? {
-        anyhow::bail!("Handle 0x{:08X} is already in use — delete it first", handle_val);
+        anyhow::bail!(
+            "Handle 0x{:08X} is already in use — delete it first",
+            handle_val
+        );
     }
 
     info!("Creating {} child key under SRK...", algo.to_uppercase());
@@ -141,11 +150,7 @@ pub(crate) fn cmd_key_create(context: &mut TpmContext, algo: &str, persist_str: 
 
     context
         .execute_with_session(Some(AuthSession::Password), |ctx| {
-            ctx.evict_control(
-                Provision::Owner,
-                child_handle.into(),
-                persistent,
-            )
+            ctx.evict_control(Provision::Owner, child_handle.into(), persistent)
         })
         .context("Failed to persist key")?;
 
@@ -153,7 +158,11 @@ pub(crate) fn cmd_key_create(context: &mut TpmContext, algo: &str, persist_str: 
         .flush_context(child_handle.into())
         .context("Failed to flush transient child handle")?;
 
-    println!("Created {} signing key at 0x{:08X}", algo.to_uppercase(), handle_val);
+    println!(
+        "Created {} signing key at 0x{:08X}",
+        algo.to_uppercase(),
+        handle_val
+    );
     println!(
         "  Algorithm: {}",
         match algo.to_lowercase().as_str() {
@@ -191,17 +200,14 @@ pub(crate) fn cmd_key_list(context: &mut TpmContext) -> Result<()> {
                         match context.read_public(key_handle) {
                             Ok((public, _, _)) => {
                                 let (algo, attrs) = match &public {
-                                    Public::Rsa { object_attributes, .. } => {
-                                        ("RSA", *object_attributes)
-                                    }
-                                    Public::Ecc { object_attributes, .. } => {
-                                        ("ECC", *object_attributes)
-                                    }
+                                    Public::Rsa {
+                                        object_attributes, ..
+                                    } => ("RSA", *object_attributes),
+                                    Public::Ecc {
+                                        object_attributes, ..
+                                    } => ("ECC", *object_attributes),
                                     other => {
-                                        println!(
-                                            "  0x{:08X}  {:?}",
-                                            handle_val, other
-                                        );
+                                        println!("  0x{:08X}  {:?}", handle_val, other);
                                         continue;
                                     }
                                 };

@@ -27,11 +27,9 @@ fn main() -> Result<()> {
         return commands::cmd_version();
     }
 
-    let tcti_conf =
-        TctiNameConf::from_str(&cli.tcti).context("Invalid TCTI string")?;
+    let tcti_conf = TctiNameConf::from_str(&cli.tcti).context("Invalid TCTI string")?;
 
-    let mut context =
-        tss_esapi::Context::new(tcti_conf).context("Failed to create TPM context")?;
+    let mut context = tss_esapi::Context::new(tcti_conf).context("Failed to create TPM context")?;
 
     match cli.command {
         Commands::Info => commands::cmd_info(&mut context),
@@ -42,14 +40,15 @@ fn main() -> Result<()> {
         Commands::Sign { data, ecc, key } => {
             sign::cmd_sign(&mut context, &data, ecc, key.as_deref())
         }
-        Commands::Verify { data, key, sig } => {
-            verify::cmd_verify(&mut context, &data, &key, &sig)
-        }
+        Commands::Verify { data, key, sig } => verify::cmd_verify(&mut context, &data, &key, &sig),
         Commands::Seal { data, pcrs, out } => seal::cmd_seal(&mut context, &data, &pcrs, &out),
         Commands::Unseal { input, pcrs } => seal::cmd_unseal(&mut context, &input, &pcrs),
-        Commands::Quote { pcrs, nonce, algo, out } => {
-            quote::cmd_quote(&mut context, &pcrs, nonce.as_deref(), &algo, out.as_deref())
-        }
+        Commands::Quote {
+            pcrs,
+            nonce,
+            algo,
+            out,
+        } => quote::cmd_quote(&mut context, &pcrs, nonce.as_deref(), &algo, out.as_deref()),
         Commands::QuoteVerify { input } => quote::cmd_quote_verify(&mut context, &input),
         Commands::Key(sub) => match sub {
             KeyCommands::Create { algo, persist } => {

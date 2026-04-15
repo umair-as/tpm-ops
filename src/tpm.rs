@@ -23,12 +23,18 @@ pub(crate) const PERSISTENT_SRK_HANDLE: u32 = 0x81000000;
 
 /// Parse a hex handle string like "0x81000001" into a u32.
 pub(crate) fn parse_handle(s: &str) -> Result<u32> {
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     u32::from_str_radix(s, 16).context("Invalid handle — expected hex like 0x81000001")
 }
 
 /// Create an ESYS ObjectHandle from a persistent TPM handle value.
-pub(crate) fn persistent_to_esys(context: &mut TpmContext, handle_val: u32) -> Result<ObjectHandle> {
+pub(crate) fn persistent_to_esys(
+    context: &mut TpmContext,
+    handle_val: u32,
+) -> Result<ObjectHandle> {
     let persistent_handle =
         PersistentTpmHandle::new(handle_val).context("Invalid persistent handle range")?;
     context
@@ -58,7 +64,6 @@ pub(crate) fn persistent_handle_exists(context: &mut TpmContext, handle_val: u32
     Ok(false)
 }
 
-
 pub(crate) fn parse_hash_algo(algo: &str) -> Result<HashingAlgorithm> {
     match algo.to_lowercase().as_str() {
         "sha256" => Ok(HashingAlgorithm::Sha256),
@@ -83,7 +88,8 @@ impl<'a> KeyGuard<'a> {
     }
 
     pub fn handle(&self) -> KeyHandle {
-        self.handle.expect("KeyGuard: handle already consumed (bug)")
+        self.handle
+            .expect("KeyGuard: handle already consumed (bug)")
     }
 }
 
@@ -106,7 +112,10 @@ pub(crate) fn create_srk(context: &mut TpmContext) -> Result<KeyHandle> {
     // Fast path: SRK already persisted from a previous run.
     if persistent_handle_exists(context, PERSISTENT_SRK_HANDLE)? {
         let obj_handle = persistent_to_esys(context, PERSISTENT_SRK_HANDLE)?;
-        debug!("Using existing persistent SRK at 0x{:08X}", PERSISTENT_SRK_HANDLE);
+        debug!(
+            "Using existing persistent SRK at 0x{:08X}",
+            PERSISTENT_SRK_HANDLE
+        );
         return Ok(KeyHandle::from(obj_handle));
     }
 
@@ -180,8 +189,8 @@ pub(crate) fn pcr_selection_sha256(indices: &[u8]) -> Result<PcrSelectionList> {
         let pcr_mask = 1u32
             .checked_shl(idx as u32)
             .ok_or_else(|| anyhow::anyhow!("Invalid PCR shift for index {}", idx))?;
-        let slot = PcrSlot::try_from(pcr_mask)
-            .with_context(|| format!("Invalid PCR slot {}", idx))?;
+        let slot =
+            PcrSlot::try_from(pcr_mask).with_context(|| format!("Invalid PCR slot {}", idx))?;
         slots.push(slot);
     }
     PcrSelectionListBuilder::new()

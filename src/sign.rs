@@ -83,8 +83,12 @@ pub(crate) fn sign_with_persistent_key(
             let mut r = s.signature_r().value().to_vec();
             let mut s_bytes = s.signature_s().value().to_vec();
             // Left-pad with zeros if shorter than 32 bytes
-            while r.len() < 32 { r.insert(0, 0); }
-            while s_bytes.len() < 32 { s_bytes.insert(0, 0); }
+            while r.len() < 32 {
+                r.insert(0, 0);
+            }
+            while s_bytes.len() < 32 {
+                s_bytes.insert(0, 0);
+            }
             let mut out = r;
             out.extend_from_slice(&s_bytes);
             out
@@ -99,16 +103,17 @@ pub(crate) fn sign_with_persistent_key(
 fn cmd_sign_persistent(context: &mut TpmContext, data: &str, handle_str: &str) -> Result<()> {
     let handle_val = parse_handle(handle_str)?;
 
-    info!(
-        "Signing with persistent key at 0x{:08X}...",
-        handle_val
-    );
+    info!("Signing with persistent key at 0x{:08X}...", handle_val);
 
     let (is_ecc, digest_hex, sig_bytes) = sign_with_persistent_key(context, data, handle_str)?;
 
     println!("\nData: {}", data);
     println!("Digest (SHA256): {}", digest_hex);
-    println!("Key: 0x{:08X} (persistent, {})", handle_val, if is_ecc { "ECC" } else { "RSA" });
+    println!(
+        "Key: 0x{:08X} (persistent, {})",
+        handle_val,
+        if is_ecc { "ECC" } else { "RSA" }
+    );
 
     if is_ecc {
         println!("\nSignature (ECDSA):");

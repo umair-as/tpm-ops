@@ -89,7 +89,10 @@ impl QuoteBlob {
 }
 
 /// Create an ephemeral restricted RSA signing key (AK) under the SRK.
-fn create_ak_rsa(srk: tss_esapi::handles::KeyHandle, context: &mut TpmContext) -> Result<(tss_esapi::handles::KeyHandle, Public)> {
+fn create_ak_rsa(
+    srk: tss_esapi::handles::KeyHandle,
+    context: &mut TpmContext,
+) -> Result<(tss_esapi::handles::KeyHandle, Public)> {
     let attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
@@ -137,7 +140,10 @@ fn create_ak_rsa(srk: tss_esapi::handles::KeyHandle, context: &mut TpmContext) -
 }
 
 /// Create an ephemeral restricted ECC signing key (AK) under the SRK.
-fn create_ak_ecc(srk: tss_esapi::handles::KeyHandle, context: &mut TpmContext) -> Result<(tss_esapi::handles::KeyHandle, Public)> {
+fn create_ak_ecc(
+    srk: tss_esapi::handles::KeyHandle,
+    context: &mut TpmContext,
+) -> Result<(tss_esapi::handles::KeyHandle, Public)> {
     let attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
         .with_fixed_parent(true)
@@ -209,10 +215,7 @@ fn sig_from_hex(sig_hex: &str, is_ecc: bool) -> Result<Signature> {
     let bytes = hex::decode(sig_hex).context("Invalid signature hex in quote blob")?;
     if is_ecc {
         if bytes.len() != 64 {
-            anyhow::bail!(
-                "ECC signature must be 64 bytes (R||S), got {}",
-                bytes.len()
-            );
+            anyhow::bail!("ECC signature must be 64 bytes (R||S), got {}", bytes.len());
         }
         let r = EccParameter::try_from(bytes[..32].to_vec()).context("Invalid R component")?;
         let s = EccParameter::try_from(bytes[32..].to_vec()).context("Invalid S component")?;
@@ -274,10 +277,7 @@ pub(crate) fn cmd_quote(
     let ak_guard = KeyGuard::new(context, ak_handle);
     let ak_handle_copy = ak_guard.handle();
 
-    info!(
-        "Running TPM2_Quote (PCRs SHA-256:{})...",
-        pcrs_normalized
-    );
+    info!("Running TPM2_Quote (PCRs SHA-256:{})...", pcrs_normalized);
 
     // Restricted keys use the key's own scheme; pass Null to the quote call.
     let (attest, signature) = ak_guard
@@ -292,7 +292,9 @@ pub(crate) fn cmd_quote(
         })
         .context("TPM2_Quote failed")?;
 
-    let attest_bytes = attest.marshall().context("Failed to marshal attest structure")?;
+    let attest_bytes = attest
+        .marshall()
+        .context("Failed to marshal attest structure")?;
     let sig_hex = sig_to_hex(&signature)?;
     let ak_pub_buffer = PublicBuffer::try_from(ak_pub).context("Failed to encode AK public")?;
     let ak_pub_hex = hex::encode(ak_pub_buffer.value());

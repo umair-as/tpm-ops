@@ -83,7 +83,10 @@ impl SealedBlob {
     }
 }
 
-fn policy_digest_for_current_pcr(context: &mut TpmContext, pcr_selection: PcrSelectionList) -> Result<Digest> {
+fn policy_digest_for_current_pcr(
+    context: &mut TpmContext,
+    pcr_selection: PcrSelectionList,
+) -> Result<Digest> {
     let trial_auth = context
         .start_auth_session(
             None,
@@ -96,8 +99,8 @@ fn policy_digest_for_current_pcr(context: &mut TpmContext, pcr_selection: PcrSel
         .context("Failed to start trial policy session")?
         .ok_or_else(|| anyhow::anyhow!("TPM returned no trial policy session handle"))?;
 
-    let trial_policy = PolicySession::try_from(trial_auth)
-        .context("Failed to create policy session handle")?;
+    let trial_policy =
+        PolicySession::try_from(trial_auth).context("Failed to create policy session handle")?;
 
     context
         .policy_pcr(trial_policy, Digest::default(), pcr_selection)
@@ -130,7 +133,12 @@ fn sealed_public(policy_digest: Digest) -> Result<Public> {
         .context("Failed to build sealed object template")
 }
 
-pub(crate) fn cmd_seal(context: &mut TpmContext, data: &str, pcrs: &str, out_path: &str) -> Result<()> {
+pub(crate) fn cmd_seal(
+    context: &mut TpmContext,
+    data: &str,
+    pcrs: &str,
+    out_path: &str,
+) -> Result<()> {
     let pcr_indices = parse_pcr_indices(pcrs)?;
     let pcrs_normalized = pcr_indices
         .iter()
@@ -141,8 +149,8 @@ pub(crate) fn cmd_seal(context: &mut TpmContext, data: &str, pcrs: &str, out_pat
     let pcr_selection = pcr_selection_sha256(&pcr_indices)?;
     let policy_digest = policy_digest_for_current_pcr(context, pcr_selection.clone())?;
 
-    let sensitive_data = SensitiveData::try_from(data.as_bytes())
-        .context("Data too large to seal for this TPM")?;
+    let sensitive_data =
+        SensitiveData::try_from(data.as_bytes()).context("Data too large to seal for this TPM")?;
 
     let public = sealed_public(policy_digest.clone())?;
 
@@ -181,7 +189,11 @@ pub(crate) fn cmd_seal(context: &mut TpmContext, data: &str, pcrs: &str, out_pat
     Ok(())
 }
 
-pub(crate) fn unseal_from_file(context: &mut TpmContext, in_path: &str, pcrs: &str) -> Result<Vec<u8>> {
+pub(crate) fn unseal_from_file(
+    context: &mut TpmContext,
+    in_path: &str,
+    pcrs: &str,
+) -> Result<Vec<u8>> {
     let raw = fs::read_to_string(Path::new(in_path))
         .with_context(|| format!("Failed to read sealed blob from {}", in_path))?;
     let blob = SealedBlob::parse(&raw)?;
@@ -203,13 +215,11 @@ pub(crate) fn unseal_from_file(context: &mut TpmContext, in_path: &str, pcrs: &s
 
     let pcr_selection = pcr_selection_sha256(&requested)?;
     let current_digest = policy_digest_for_current_pcr(context, pcr_selection.clone())?;
-    let expected_digest = hex::decode(&blob.policy_digest_hex)
-        .context("Invalid policy_digest encoding in blob")?;
+    let expected_digest =
+        hex::decode(&blob.policy_digest_hex).context("Invalid policy_digest encoding in blob")?;
 
     if current_digest.value() != expected_digest.as_slice() {
-        anyhow::bail!(
-            "Current PCR state does not satisfy blob policy (digest mismatch)"
-        );
+        anyhow::bail!("Current PCR state does not satisfy blob policy (digest mismatch)");
     }
 
     let private_bytes = hex::decode(&blob.private_hex).context("Invalid private blob hex")?;
@@ -217,8 +227,8 @@ pub(crate) fn unseal_from_file(context: &mut TpmContext, in_path: &str, pcrs: &s
 
     let private = tss_esapi::structures::Private::try_from(private_bytes)
         .context("Failed to decode private blob")?;
-    let public_buffer = PublicBuffer::try_from(public_bytes)
-        .context("Failed to decode public blob")?;
+    let public_buffer =
+        PublicBuffer::try_from(public_bytes).context("Failed to decode public blob")?;
     let public = Public::try_from(public_buffer).context("Failed to decode public area")?;
 
     let srk = create_srk(context)?;
@@ -242,8 +252,8 @@ pub(crate) fn unseal_from_file(context: &mut TpmContext, in_path: &str, pcrs: &s
         .context("Failed to start policy session")?
         .ok_or_else(|| anyhow::anyhow!("TPM returned no policy session handle"))?;
 
-    let policy_session = PolicySession::try_from(policy_auth)
-        .context("Failed to convert policy session handle")?;
+    let policy_session =
+        PolicySession::try_from(policy_auth).context("Failed to convert policy session handle")?;
 
     guard
         .context

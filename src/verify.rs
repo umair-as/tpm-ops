@@ -4,7 +4,9 @@ use log::info;
 use tss_esapi::{
     handles::KeyHandle,
     interface_types::{algorithm::HashingAlgorithm, resource_handles::Hierarchy},
-    structures::{EccParameter, EccSignature, MaxBuffer, Public, PublicKeyRsa, RsaSignature, Signature},
+    structures::{
+        EccParameter, EccSignature, MaxBuffer, Public, PublicKeyRsa, RsaSignature, Signature,
+    },
     Context as TpmContext,
 };
 
@@ -53,8 +55,7 @@ pub(crate) fn cmd_verify(
             .context("Failed to build ECC signature struct")?;
         Signature::EcDsa(sig_ecc)
     } else {
-        let rsa_bytes =
-            PublicKeyRsa::try_from(sig_bytes).context("Invalid RSA signature bytes")?;
+        let rsa_bytes = PublicKeyRsa::try_from(sig_bytes).context("Invalid RSA signature bytes")?;
         let sig_rsa = RsaSignature::create(HashingAlgorithm::Sha256, rsa_bytes)
             .context("Failed to build RSA signature struct")?;
         Signature::RsaSsa(sig_rsa)

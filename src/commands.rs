@@ -28,10 +28,9 @@ fn get_property(context: &mut TpmContext, tag: PropertyTag) -> Result<Option<u32
 pub(crate) fn cmd_info(context: &mut TpmContext) -> Result<()> {
     info!("=== TPM Information ===");
 
-    let manufacturer = get_property(context, PropertyTag::Manufacturer)?
-        .ok_or_else(|| {
-            anyhow::anyhow!("TPM did not report manufacturer — device may be unresponsive")
-        })?;
+    let manufacturer = get_property(context, PropertyTag::Manufacturer)?.ok_or_else(|| {
+        anyhow::anyhow!("TPM did not report manufacturer — device may be unresponsive")
+    })?;
 
     let mfr_bytes = manufacturer.to_be_bytes();
     let mfr_str: String = mfr_bytes
@@ -76,9 +75,7 @@ pub(crate) fn cmd_info(context: &mut TpmContext) -> Result<()> {
 pub(crate) fn cmd_selftest(context: &mut TpmContext, full: bool) -> Result<()> {
     info!("Running TPM self-test (full={})...", full);
 
-    context
-        .self_test(full)
-        .context("TPM self-test failed")?;
+    context.self_test(full).context("TPM self-test failed")?;
 
     println!("TPM self-test: PASSED");
     println!("  Mode: {}", if full { "full" } else { "incremental" });
@@ -138,7 +135,9 @@ pub(crate) fn cmd_pcr(context: &mut TpmContext, index: u8, algo: &str) -> Result
 
     info!("Reading PCR {} with {}...", index, algo.to_uppercase());
 
-    let (_, _, digest_list) = context.pcr_read(pcr_selection).context("Failed to read PCR")?;
+    let (_, _, digest_list) = context
+        .pcr_read(pcr_selection)
+        .context("Failed to read PCR")?;
 
     let digests = digest_list.value();
     if digests.is_empty() {
