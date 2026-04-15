@@ -1,38 +1,52 @@
 # tpm-ops
 
-Rust CLI tool for TPM 2.0 operations targeting the Infineon SLB9672 on Raspberry Pi 5.
+[![CI](https://github.com/umair-as/tpm-ops/actions/workflows/ci.yml/badge.svg)](https://github.com/umair-as/tpm-ops/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-stable-orange.svg)](rust-toolchain.toml)
 
-## Features
+Rust CLI for TPM 2.0 operations on the Infineon SLB9672. Targets Raspberry Pi 5 running a Yocto-based image, but works on any Linux system with a TPM kernel resource manager.
 
-- **info** — Display TPM manufacturer, firmware version, and spec revision
-- **selftest** — Run TPM self-test and report health status
-- **random** — Generate random bytes from the hardware TRNG (1–48 bytes)
-- **pcr** — Read PCR register values (SHA-1, SHA-256, SHA-384)
-- **hash** — Compute hashes using the TPM engine
-- **sign** — Create ephemeral RSA-2048 or ECC P-256 keys and sign data
-- **verify** — Verify signatures using persistent TPM keys
-- **key** — Persistent key management (create/list/delete/export-pub)
-- **seal** — Seal small secrets to PCR policy and save sealed blobs
-- **unseal** — Unseal blobs when PCR policy is satisfied
-- **test** — Run all operations as a validation suite
-- **version** — Show tool version and embedded git revision
+---
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `info` | Manufacturer, firmware version, spec revision |
+| `selftest` | Incremental or full TPM self-test |
+| `random` | Hardware TRNG bytes (1–48) |
+| `pcr` | Read PCR register (SHA-1 / SHA-256 / SHA-384) |
+| `hash` | Hash data using the TPM engine |
+| `sign` | Sign with ephemeral RSA-2048 or ECC P-256 key |
+| `verify` | Verify signature against a persistent key |
+| `key` | Persistent key management — create / list / delete / export-pub |
+| `seal` | Seal a secret to PCR policy, write blob to disk |
+| `unseal` | Unseal blob when PCR policy is satisfied |
+| `quote` | TPM2_Quote over selected PCRs with nonce |
+| `quote-verify` | Verify a quote blob |
+| `test` | Run the full validation suite |
+| `version` | Binary version and embedded git revision |
+
+---
 
 ## Requirements
 
-### Build (host)
+### Build
 
-- Rust 1.85+ (uses `tss-esapi` 7.x which links against system `libtss2`)
-- `libtss2-dev` — TPM2 TSS development headers
+- Rust stable (see [`rust-toolchain.toml`](rust-toolchain.toml))
+- `libtss2-dev` — TPM2 TSS headers and libraries
 
 ```bash
-# Ubuntu/Debian
+# Ubuntu / Debian
 sudo apt install libtss2-dev
 ```
 
-### Runtime (target)
+### Runtime
 
-- Linux kernel with `/dev/tpmrm0` (TPM kernel resource manager)
-- `libtss2-esys`, `libtss2-tcti-device` shared libraries
+- Linux kernel with `/dev/tpmrm0` (TPM resource manager)
+- `libtss2-esys`, `libtss2-tcti-device`
+
+---
 
 ## Build
 
@@ -40,12 +54,14 @@ sudo apt install libtss2-dev
 cargo build --release
 ```
 
-### Cross-compile for aarch64 (Yocto SDK)
+**Cross-compile for aarch64 (Yocto SDK):**
 
 ```bash
 source /opt/poky/4.0/environment-setup-cortexa76-poky-linux
 cargo build --target aarch64-unknown-linux-gnu --release
 ```
+
+---
 
 ## Usage
 
@@ -53,52 +69,67 @@ cargo build --target aarch64-unknown-linux-gnu --release
 tpm-ops [OPTIONS] <COMMAND>
 
 Options:
-  -d, --device <DEVICE>  TCTI device path [default: /dev/tpmrm0]
-
-Commands:
-  info      Display TPM information and capabilities
-  selftest  Run TPM self-test and report health status
-  random    Generate random bytes using TPM TRNG
-  pcr       Read PCR values
-  hash      Hash data using TPM
-  sign      Create a key pair in TPM and sign data
-  verify    Verify a signature using a persistent TPM key
-  seal      Seal data to current PCR state and save sealed blob
-  unseal    Unseal data from a sealed blob if PCR policy is satisfied
-  key       Manage persistent TPM keys
-  test      Run all operations as a validation suite
-  version   Show version and build information
+  -t, --tcti <TCTI>  TCTI string [default: device:/dev/tpmrm0]
 ```
 
 ### Examples
 
 ```bash
-tpm-ops info                    # Manufacturer, firmware, spec revision
-tpm-ops selftest                # Incremental TPM self-test
-tpm-ops selftest --full         # Full TPM self-test
-tpm-ops random -b 32            # 32 random bytes from TRNG
-tpm-ops pcr -i 0                # Read PCR[0] SHA-256
-tpm-ops hash "hello"            # TPM-computed SHA-256
-tpm-ops sign "test"             # RSA-2048 sign
-tpm-ops sign "test" --ecc       # ECC P-256 sign
+# Basic ops
+tpm-ops info
+tpm-ops selftest --full
+tpm-ops random -b 32
+tpm-ops pcr -i 0
+tpm-ops hash "hello world"
+
+# Ephemeral signing
+tpm-ops sign "message"
+tpm-ops sign "message" --ecc
+
+# Persistent keys
 tpm-ops key create --algo rsa --persist 0x81000001
-tpm-ops sign "test" --key 0x81000001
-tpm-ops verify "test" --key 0x81000001 --sig <hex>
-tpm-ops seal "bootstrap-secret" --pcrs 0,7 --out sealed.blob
+tpm-ops key list
+tpm-ops sign "message" --key 0x81000001
+tpm-ops verify "message" --key 0x81000001 --sig <hex>
+tpm-ops key delete 0x81000001
+
+# Seal / unseal
+tpm-ops seal "my-secret" --pcrs 0,7 --out sealed.blob
 tpm-ops unseal --in sealed.blob --pcrs 0,7
-tpm-ops version                 # Binary version + git hash
-tpm-ops test                    # Run full validation suite
+
+# Attestation
+tpm-ops quote --pcrs 0,7 --out quote.blob
+tpm-ops quote-verify quote.blob
+
+# Software TPM (testing)
+tpm-ops --tcti "swtpm:port=2321" test
 ```
 
-## Troubleshooting
+---
 
-- `Missing authorization session` during `sign`: use a build that includes commit `4e48d8e` or newer.
-- `Invalid PCR slot` for `pcr -i 0`: use a build that includes commit `4e48d8e` or newer.
+## Testing with swtpm
+
+No hardware TPM needed for development:
+
+```bash
+mkdir -p /tmp/swtpm
+swtpm socket \
+  --tpmstate dir=/tmp/swtpm \
+  --ctrl type=tcp,port=2322 \
+  --server type=tcp,port=2321 \
+  --tpm2 --flags startup-clear --daemon
+
+tpm-ops --tcti "swtpm:port=2321" test
+```
+
+---
 
 ## Hardware
 
-Tested on Raspberry Pi 5 with Infineon SLB9672 TPM 2.0 connected via SPI (RP1 SPI0 CS1).
+Tested on **Raspberry Pi 5** with **Infineon SLB9672** TPM 2.0 over SPI (RP1 SPI0 CS1).
+
+---
 
 ## License
 
-MIT
+[MIT](LICENSE)
