@@ -16,7 +16,7 @@ use clap::Parser;
 use std::str::FromStr;
 
 use cli::{Cli, Commands, KeyCommands};
-use tss_esapi::tcti_ldr::{DeviceConfig, TctiNameConf};
+use tss_esapi::tcti_ldr::TctiNameConf;
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -27,9 +27,8 @@ fn main() -> Result<()> {
         return commands::cmd_version();
     }
 
-    let device_config =
-        DeviceConfig::from_str(&cli.device).context("Invalid TCTI device path")?;
-    let tcti_conf = TctiNameConf::Device(device_config);
+    let tcti_conf =
+        TctiNameConf::from_str(&cli.tcti).context("Invalid TCTI string")?;
 
     let mut context =
         tss_esapi::Context::new(tcti_conf).context("Failed to create TPM context")?;

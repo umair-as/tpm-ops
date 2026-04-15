@@ -7,9 +7,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[command(about = "TPM 2.0 operations tool for Infineon SLB9672", long_about = None)]
 #[command(version = VERSION)]
 pub(crate) struct Cli {
-    /// TCTI device path
-    #[arg(short, long, default_value = "/dev/tpmrm0")]
-    pub device: String,
+    /// TCTI string (e.g. device:/dev/tpmrm0, swtpm:path=/tmp/swtpm.sock)
+    #[arg(short, long, default_value = "device:/dev/tpmrm0")]
+    pub tcti: String,
 
     #[command(subcommand)]
     pub command: Commands,

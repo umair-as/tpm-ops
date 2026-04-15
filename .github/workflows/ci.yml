@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: error
+
+jobs:
+  build-lint:
+    name: Build & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tpm2-tss dev headers
+        run: sudo apt-get install -y --no-install-recommends libtss2-dev
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+      - name: cargo build
+        run: cargo build --release
+
+  integration-test:
+    name: Integration Tests (swtpm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            libtss2-dev \
+            libtss2-tcti-swtpm0 \
+            swtpm \
+            swtpm-tools
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: cargo build
+        run: cargo build --release
+
+      - name: Start swtpm
+        run: |
+          mkdir -p /tmp/swtpm
+          swtpm socket \
+            --tpmstate dir=/tmp/swtpm \
+            --ctrl type=tcp,port=2322 \
+            --server type=tcp,port=2321 \
+            --tpm2 \
+            --flags startup-clear \
+            --daemon
+          # Wait for swtpm to be ready
+          timeout 5 bash -c 'until ss -tlnp | grep -q 2321; do sleep 0.1; done'
+
+      - name: Run integration tests
+        run: ./target/release/tpm-ops --tcti "swtpm:port=2321" test
+
+      - name: Stop swtpm
+        if: always()
+        run: pkill swtpm || true
