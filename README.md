@@ -149,6 +149,30 @@ tpm-ops --tcti "swtpm:port=2321" test
 
 ---
 
+## Supply-chain security
+
+`Cargo.lock` is committed so builds, audits, and SBOMs resolve the same dependency
+versions. CI performs the following checks:
+
+- RustSec vulnerability and informational-warning scanning on every push and
+  pull request, plus a weekly rescan for newly published advisories;
+- 90-day retention of the machine-readable RustSec JSON report;
+- CycloneDX 1.5 JSON SBOM generation with `cargo-cyclonedx`;
+- 90-day retention of the SBOM as a workflow artifact; and
+- a signed GitHub SBOM attestation for builds pushed to `main`.
+
+To reproduce the checks locally:
+
+```bash
+cargo install cargo-audit --version 0.22.2 --locked
+cargo audit --deny warnings
+
+cargo install cargo-cyclonedx --version 0.5.9 --locked
+cargo cyclonedx --format json --spec-version 1.5
+```
+
+---
+
 ## Hardware
 
 Tested on **Raspberry Pi 5** with **Infineon SLB9672** TPM 2.0 over SPI (RP1 SPI0 CS1).
