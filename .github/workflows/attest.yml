@@ -1,0 +1,56 @@
+---
+name: Release SBOM Attestation
+
+# This privileged workflow only runs after code lands on main. Keeping it
+# separate from pull-request CI prevents PR-authored workflow changes from
+# receiving OIDC and attestation write credentials.
+# yamllint disable-line rule:truthy
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  attest-sbom:
+    name: Attest SBOM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain
+        # dtolnay/rust-toolchain stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+
+      - name: Install tpm2-tss dev headers
+        run: sudo apt-get install -y --no-install-recommends libtss2-dev
+
+      - name: Install pinned CycloneDX generator
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Build release binary from locked dependencies
+        run: cargo build --release --locked
+
+      - name: Generate CycloneDX 1.5 JSON SBOM
+        run: |
+          mkdir -p artifacts
+          cargo cyclonedx \
+            --format json \
+            --spec-version 1.5 \
+            --override-filename tpm-ops.cdx
+          mv tpm-ops.cdx.json artifacts/tpm-ops.cdx.json
+          jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.5"' \
+            artifacts/tpm-ops.cdx.json >/dev/null
+
+      - name: Attest release binary with SBOM
+        # actions/attest v4
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
+        with:
+          subject-path: target/release/tpm-ops
+          sbom-path: artifacts/tpm-ops.cdx.json

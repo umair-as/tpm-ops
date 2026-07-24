@@ -114,7 +114,7 @@ pub(crate) enum Commands {
         #[arg(short, long, default_value = "0,7")]
         pcrs: String,
 
-        /// Nonce as hex string (auto-generated if omitted)
+        /// Nonce as hex string, 16-64 bytes (32 random bytes if omitted)
         #[arg(short, long)]
         nonce: Option<String>,
 
@@ -132,7 +132,7 @@ pub(crate) enum Commands {
         /// Path to the quote blob file
         input: String,
 
-        /// Expected challenge nonce as hex (must come from the verifier)
+        /// Expected challenge nonce as hex, 16-64 bytes (must come from the verifier)
         #[arg(long)]
         nonce: String,
 

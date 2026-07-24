@@ -166,9 +166,24 @@ pub(crate) fn cmd_key_create(
         })
         .context("Failed to persist key")?;
 
-    context
-        .flush_context(child_handle.into())
-        .context("Failed to flush transient child handle")?;
+    if let Err(flush_error) = context.flush_context(child_handle.into()) {
+        let rollback_result = cmd_key_delete(context, persist_str);
+        match rollback_result {
+            Ok(()) => {
+                return Err(flush_error)
+                    .context("Failed to flush transient child handle; persistent key rolled back");
+            }
+            Err(rollback_error) => {
+                anyhow::bail!(
+                    "Failed to flush transient child handle: {}; \
+                     rollback of persistent key {} also failed: {:#}",
+                    flush_error,
+                    persist_str,
+                    rollback_error
+                );
+            }
+        }
+    }
 
     println!(
         "Created {} signing key at 0x{:08X}",

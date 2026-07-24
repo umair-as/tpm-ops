@@ -121,6 +121,10 @@ key carried inside the quote blob. The verifier must provide:
 - a SHA-256 fingerprint of the AK public area obtained through a trusted
   provisioning channel.
 
+Challenge nonces must contain 16 to 64 bytes. When `--nonce` is omitted during
+quote generation, the TPM RNG is read until a complete 32-byte nonce is
+available.
+
 The current `quote` command creates an ephemeral AK, so its fingerprint changes
 for every quote. This is suitable for local round-trip diagnostics when the
 fingerprint is transferred over an authenticated channel. A production remote

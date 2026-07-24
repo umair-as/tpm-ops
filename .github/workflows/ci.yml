@@ -150,8 +150,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     steps:
       # actions/checkout v4
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -188,11 +186,3 @@ jobs:
           path: artifacts/tpm-ops.cdx.json
           if-no-files-found: error
           retention-days: 90
-
-      - name: Attest SBOM
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        # actions/attest v4
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6
-        with:
-          subject-path: target/release/tpm-ops
-          sbom-path: artifacts/tpm-ops.cdx.json

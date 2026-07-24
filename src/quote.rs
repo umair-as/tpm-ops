@@ -22,9 +22,14 @@ use tss_esapi::{
     Context as TpmContext,
 };
 
-use crate::tpm::{create_srk, parse_pcr_indices, pcr_selection_sha256, KeyGuard};
+use crate::{
+    commands::random_bytes,
+    tpm::{create_srk, parse_pcr_indices, pcr_selection_sha256, KeyGuard},
+};
 
 const QUOTE_BLOB_MAGIC: &str = "TPM_OPS_QUOTE_V1";
+const MIN_NONCE_BYTES: usize = 16;
+const DEFAULT_NONCE_BYTES: usize = 32;
 
 struct QuoteBlob {
     algo: String,
@@ -94,6 +99,19 @@ fn normalize_sha256_hex(value: &str, field: &str) -> Result<String> {
         anyhow::bail!("{field} must be 32 bytes, got {}", bytes.len());
     }
     Ok(hex::encode(bytes))
+}
+
+fn validate_nonce(nonce: Vec<u8>, field: &str) -> Result<Vec<u8>> {
+    if nonce.len() < MIN_NONCE_BYTES {
+        anyhow::bail!(
+            "{field} must be at least {MIN_NONCE_BYTES} bytes, got {}",
+            nonce.len()
+        );
+    }
+    if nonce.len() > 64 {
+        anyhow::bail!("{field} must be at most 64 bytes, got {}", nonce.len());
+    }
+    Ok(nonce)
 }
 
 fn ak_public_fingerprint(context: &mut TpmContext, public_bytes: &[u8]) -> Result<String> {
@@ -281,13 +299,13 @@ pub(crate) fn cmd_quote(
         .join(",");
     let pcr_selection = pcr_selection_sha256(&pcr_indices)?;
 
-    // Nonce: provided hex or freshly generated 32 random bytes.
+    // Nonce: verifier-provided hex or exactly 32 fresh random bytes.
     let nonce_bytes: Vec<u8> = match nonce_opt {
-        Some(hex_str) => hex::decode(hex_str).context("Invalid nonce hex")?,
-        None => {
-            let rand = context.get_random(32).context("Failed to generate nonce")?;
-            rand.value().to_vec()
+        Some(hex_str) => {
+            validate_nonce(hex::decode(hex_str).context("Invalid nonce hex")?, "Nonce")?
         }
+        None => random_bytes(context, DEFAULT_NONCE_BYTES)
+            .context("Failed to generate a complete nonce")?,
     };
     let qualifying_data =
         Data::try_from(nonce_bytes.as_slice()).context("Nonce too large (max 64 bytes)")?;
@@ -391,11 +409,10 @@ pub(crate) fn cmd_quote_verify(
         other => anyhow::bail!("Unsupported quote algorithm in blob: {}", other),
     };
 
-    let expected_nonce =
-        hex::decode(expected_nonce_hex.trim()).context("Invalid expected nonce hex")?;
-    if expected_nonce.is_empty() {
-        anyhow::bail!("Expected nonce must not be empty");
-    }
+    let expected_nonce = validate_nonce(
+        hex::decode(expected_nonce_hex.trim()).context("Invalid expected nonce hex")?,
+        "Expected nonce",
+    )?;
     let expected_ak_pub_sha256 =
         normalize_sha256_hex(expected_ak_pub_sha256, "Expected AK fingerprint")?;
     let expected_pcr_indices = parse_pcr_indices(expected_pcrs)?;
@@ -495,7 +512,7 @@ pub(crate) fn cmd_quote_verify(
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_sha256_hex;
+    use super::{normalize_sha256_hex, validate_nonce};
 
     #[test]
     fn sha256_fingerprint_is_normalized() {
@@ -516,5 +533,23 @@ mod tests {
     fn sha256_fingerprint_rejects_non_hex_input() {
         let error = normalize_sha256_hex(&"zz".repeat(32), "fingerprint").unwrap_err();
         assert!(error.to_string().contains("Invalid fingerprint hex"));
+    }
+
+    #[test]
+    fn nonce_rejects_values_shorter_than_128_bits() {
+        let error = validate_nonce(vec![0; 15], "Nonce").unwrap_err();
+        assert!(error.to_string().contains("at least 16 bytes"));
+    }
+
+    #[test]
+    fn nonce_accepts_128_to_512_bits() {
+        assert_eq!(validate_nonce(vec![0; 16], "Nonce").unwrap().len(), 16);
+        assert_eq!(validate_nonce(vec![0; 64], "Nonce").unwrap().len(), 64);
+    }
+
+    #[test]
+    fn nonce_rejects_values_larger_than_tpm2b_data() {
+        let error = validate_nonce(vec![0; 65], "Nonce").unwrap_err();
+        assert!(error.to_string().contains("at most 64 bytes"));
     }
 }
