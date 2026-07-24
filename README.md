@@ -97,13 +97,38 @@ tpm-ops key delete 0x81000001
 tpm-ops seal "my-secret" --pcrs 0,7 --out sealed.blob
 tpm-ops unseal --in sealed.blob --pcrs 0,7
 
-# Attestation
-tpm-ops quote --pcrs 0,7 --out quote.blob
-tpm-ops quote-verify quote.blob
+# Attestation: the verifier supplies the challenge and expected PCR selection.
+tpm-ops quote --pcrs 0,7 --nonce <challenge-hex> --out quote.blob
+
+# Provision the printed "AK SHA-256" fingerprint through a trusted channel,
+# then require all three independent expectations during verification.
+tpm-ops quote-verify quote.blob \
+  --nonce <challenge-hex> \
+  --ak-pub-sha256 <trusted-ak-fingerprint> \
+  --pcrs 0,7
 
 # Software TPM (testing)
 tpm-ops --tcti "swtpm:port=2321" test
 ```
+
+### Quote trust model
+
+`quote-verify` deliberately does not trust the nonce, PCR label, or AK public
+key carried inside the quote blob. The verifier must provide:
+
+- the challenge nonce it issued;
+- the expected SHA-256 PCR selection; and
+- a SHA-256 fingerprint of the AK public area obtained through a trusted
+  provisioning channel.
+
+The current `quote` command creates an ephemeral AK, so its fingerprint changes
+for every quote. This is suitable for local round-trip diagnostics when the
+fingerprint is transferred over an authenticated channel. A production remote
+attestation deployment should provision and pin a stable AK identity.
+
+The hardware test suite reserves persistent handles `0x81000FFD` through
+`0x81000FFF`. It now refuses to run if any of those handles are occupied and
+never deletes a pre-existing key.
 
 ---
 

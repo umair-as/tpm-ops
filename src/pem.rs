@@ -37,16 +37,14 @@ pub(crate) fn encode_rsa_pubkey_der(modulus: &[u8], exponent: &[u8]) -> Vec<u8> 
     der_sequence(&content)
 }
 
-/// Encode EC public key in SubjectPublicKeyInfo DER format (for P-256).
-pub(crate) fn encode_ec_pubkey_der(uncompressed_point: &[u8]) -> Vec<u8> {
+/// Encode an EC public key in SubjectPublicKeyInfo DER format.
+pub(crate) fn encode_ec_pubkey_der(uncompressed_point: &[u8], named_curve_oid: &[u8]) -> Vec<u8> {
     // OID for id-ecPublicKey (1.2.840.10045.2.1)
     let ec_pubkey_oid: &[u8] = &[0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01];
-    // OID for prime256v1 / P-256 (1.2.840.10045.3.1.7)
-    let p256_oid: &[u8] = &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
 
     let mut algo_id = Vec::new();
     algo_id.extend_from_slice(ec_pubkey_oid);
-    algo_id.extend_from_slice(p256_oid);
+    algo_id.extend_from_slice(named_curve_oid);
     let algo_seq = der_sequence(&algo_id);
 
     let mut bitstring = vec![0x03];
@@ -95,4 +93,33 @@ fn base64_encode(data: &[u8]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_matches_standard_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn rsa_der_uses_supplied_exponent() {
+        let der = encode_rsa_pubkey_der(&[0x01, 0x02, 0x03], &[0x03]);
+        assert_eq!(
+            der,
+            vec![0x30, 0x08, 0x02, 0x03, 0x01, 0x02, 0x03, 0x02, 0x01, 0x03]
+        );
+    }
+
+    #[test]
+    fn ec_der_uses_supplied_curve_oid() {
+        let curve_oid = [0x06, 0x03, 0x2B, 0x65, 0x70];
+        let der = encode_ec_pubkey_der(&[0x04, 0x01, 0x02], &curve_oid);
+        assert!(der.windows(curve_oid.len()).any(|bytes| bytes == curve_oid));
+    }
 }
