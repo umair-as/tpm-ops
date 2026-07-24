@@ -49,7 +49,12 @@ fn main() -> Result<()> {
             algo,
             out,
         } => quote::cmd_quote(&mut context, &pcrs, nonce.as_deref(), &algo, out.as_deref()),
-        Commands::QuoteVerify { input } => quote::cmd_quote_verify(&mut context, &input),
+        Commands::QuoteVerify {
+            input,
+            nonce,
+            ak_pub_sha256,
+            pcrs,
+        } => quote::cmd_quote_verify(&mut context, &input, &nonce, &ak_pub_sha256, &pcrs),
         Commands::Key(sub) => match sub {
             KeyCommands::Create { algo, persist } => {
                 keys::cmd_key_create(&mut context, &algo, &persist)

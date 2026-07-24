@@ -1,10 +1,16 @@
+---
 name: CI
 
+# GitHub Actions requires the YAML 1.1 boolean-like key `on`.
+# yamllint disable-line rule:truthy
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Re-scan the lockfile when the RustSec advisory database changes.
+    - cron: "17 3 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -13,12 +19,15 @@ env:
 jobs:
   build-lint:
     name: Build & Lint
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           components: rustfmt, clippy
 
@@ -26,7 +35,8 @@ jobs:
         run: sudo apt-get install -y --no-install-recommends libtss2-dev
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        # actions/cache v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry
@@ -39,19 +49,22 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --locked -- -D warnings
 
       - name: cargo build
-        run: cargo build --release
+        run: cargo build --release --locked
 
   integration-test:
     name: Integration Tests (swtpm)
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
 
       - name: Install dependencies
         run: |
@@ -62,7 +75,8 @@ jobs:
             swtpm-tools
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        # actions/cache v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
         with:
           path: |
             ~/.cargo/registry
@@ -72,7 +86,7 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: cargo build
-        run: cargo build --release
+        run: cargo build --release --locked
 
       - name: Start swtpm
         run: |
@@ -93,3 +107,82 @@ jobs:
       - name: Stop swtpm
         if: always()
         run: pkill swtpm || true
+
+  security-audit:
+    name: RustSec Audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain
+        # dtolnay/rust-toolchain stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+
+      - name: Install pinned RustSec auditor
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
+      - name: Audit locked dependencies
+        run: cargo audit --deny warnings
+
+      - name: Write machine-readable audit report
+        if: always()
+        run: |
+          mkdir -p artifacts
+          cargo audit --json > artifacts/rustsec-audit.json \
+            || test -s artifacts/rustsec-audit.json
+
+      - name: Upload audit report
+        if: always()
+        # actions/upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tpm-ops-rustsec-audit
+          path: artifacts/rustsec-audit.json
+          if-no-files-found: error
+          retention-days: 90
+
+  sbom:
+    name: CycloneDX SBOM
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain
+        # dtolnay/rust-toolchain stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+
+      - name: Install tpm2-tss dev headers
+        run: sudo apt-get install -y --no-install-recommends libtss2-dev
+
+      - name: Install pinned CycloneDX generator
+        run: cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Build release binary from locked dependencies
+        run: cargo build --release --locked
+
+      - name: Generate CycloneDX 1.5 JSON SBOM
+        run: |
+          mkdir -p artifacts
+          cargo cyclonedx \
+            --format json \
+            --spec-version 1.5 \
+            --override-filename tpm-ops.cdx
+          mv tpm-ops.cdx.json artifacts/tpm-ops.cdx.json
+          jq -e '.bomFormat == "CycloneDX" and .specVersion == "1.5"' \
+            artifacts/tpm-ops.cdx.json >/dev/null
+
+      - name: Upload SBOM
+        # actions/upload-artifact v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tpm-ops-cyclonedx-sbom
+          path: artifacts/tpm-ops.cdx.json
+          if-no-files-found: error
+          retention-days: 90

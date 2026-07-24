@@ -18,7 +18,6 @@ use tss_esapi::{
         PublicBuilder, PublicEccParametersBuilder, PublicKeyRsa, PublicRsaParametersBuilder,
         RsaExponent, RsaScheme,
     },
-    utils::PublicKey,
     Context as TpmContext,
 };
 
@@ -26,6 +25,19 @@ use crate::pem::{der_to_pem, encode_ec_pubkey_der, encode_rsa_pubkey_der};
 use crate::tpm::{
     create_srk, parse_handle, persistent_handle_exists, persistent_to_esys, PERSISTENT_SRK_HANDLE,
 };
+
+fn pad_ec_coordinate(value: &[u8], coordinate_size: usize) -> Result<Vec<u8>> {
+    if value.len() > coordinate_size {
+        anyhow::bail!(
+            "ECC coordinate is {} bytes, larger than the curve size {}",
+            value.len(),
+            coordinate_size
+        );
+    }
+    let mut padded = vec![0; coordinate_size - value.len()];
+    padded.extend_from_slice(value);
+    Ok(padded)
+}
 
 /// Build a public template for an unrestricted signing child key.
 fn signing_key_template(algo: &str) -> Result<Public> {
@@ -154,9 +166,24 @@ pub(crate) fn cmd_key_create(
         })
         .context("Failed to persist key")?;
 
-    context
-        .flush_context(child_handle.into())
-        .context("Failed to flush transient child handle")?;
+    if let Err(flush_error) = context.flush_context(child_handle.into()) {
+        let rollback_result = cmd_key_delete(context, persist_str);
+        match rollback_result {
+            Ok(()) => {
+                return Err(flush_error)
+                    .context("Failed to flush transient child handle; persistent key rolled back");
+            }
+            Err(rollback_error) => {
+                anyhow::bail!(
+                    "Failed to flush transient child handle: {}; \
+                     rollback of persistent key {} also failed: {:#}",
+                    flush_error,
+                    persist_str,
+                    rollback_error
+                );
+            }
+        }
+    }
 
     println!(
         "Created {} signing key at 0x{:08X}",
@@ -303,26 +330,71 @@ pub(crate) fn cmd_key_export_pub(context: &mut TpmContext, handle_str: &str) -> 
         .read_public(key_handle)
         .context("Failed to read public area")?;
 
-    let pub_key = PublicKey::try_from(public)
-        .map_err(|_| anyhow::anyhow!("Unsupported key type at 0x{:08X}", handle_val))?;
-
-    match pub_key {
-        PublicKey::Rsa(modulus_bytes) => {
-            let der = encode_rsa_pubkey_der(&modulus_bytes, &[0x01, 0x00, 0x01]);
+    match public {
+        Public::Rsa {
+            parameters, unique, ..
+        } => {
+            let exponent = match parameters.exponent().value() {
+                0 => 65_537,
+                value => value,
+            };
+            let exponent_bytes = exponent.to_be_bytes();
+            let first_nonzero = exponent_bytes
+                .iter()
+                .position(|&byte| byte != 0)
+                .unwrap_or(exponent_bytes.len() - 1);
+            let der = encode_rsa_pubkey_der(unique.value(), &exponent_bytes[first_nonzero..]);
             let pem = der_to_pem(&der, "RSA PUBLIC KEY");
             println!("{}", pem);
         }
-        PublicKey::Ecc { x, y } => {
+        Public::Ecc {
+            parameters, unique, ..
+        } => {
+            let (curve_oid, coordinate_size): (&[u8], usize) = match parameters.ecc_curve() {
+                EccCurve::NistP192 => (
+                    &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x01],
+                    24,
+                ),
+                EccCurve::NistP224 => (&[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x21], 28),
+                EccCurve::NistP256 => (
+                    &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07],
+                    32,
+                ),
+                EccCurve::NistP384 => (&[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x22], 48),
+                EccCurve::NistP521 => (&[0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23], 66),
+                curve => anyhow::bail!("PEM export does not support ECC curve {:?}", curve),
+            };
+            let x = pad_ec_coordinate(unique.x().value(), coordinate_size)?;
+            let y = pad_ec_coordinate(unique.y().value(), coordinate_size)?;
             let mut point = Vec::with_capacity(1 + x.len() + y.len());
             point.push(0x04);
             point.extend_from_slice(&x);
             point.extend_from_slice(&y);
 
-            let der = encode_ec_pubkey_der(&point);
+            let der = encode_ec_pubkey_der(&point, curve_oid);
             let pem = der_to_pem(&der, "PUBLIC KEY");
             println!("{}", pem);
         }
+        _ => anyhow::bail!("Unsupported key type at 0x{:08X}", handle_val),
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pad_ec_coordinate;
+
+    #[test]
+    fn ec_coordinates_are_left_padded_to_curve_size() {
+        assert_eq!(
+            pad_ec_coordinate(&[0x01, 0x02], 4).unwrap(),
+            vec![0x00, 0x00, 0x01, 0x02]
+        );
+    }
+
+    #[test]
+    fn oversized_ec_coordinates_are_rejected() {
+        assert!(pad_ec_coordinate(&[0; 5], 4).is_err());
+    }
 }

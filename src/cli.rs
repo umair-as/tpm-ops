@@ -114,7 +114,7 @@ pub(crate) enum Commands {
         #[arg(short, long, default_value = "0,7")]
         pcrs: String,
 
-        /// Nonce as hex string (auto-generated if omitted)
+        /// Nonce as hex string, 16-64 bytes (32 random bytes if omitted)
         #[arg(short, long)]
         nonce: Option<String>,
 
@@ -131,6 +131,18 @@ pub(crate) enum Commands {
     QuoteVerify {
         /// Path to the quote blob file
         input: String,
+
+        /// Expected challenge nonce as hex, 16-64 bytes (must come from the verifier)
+        #[arg(long)]
+        nonce: String,
+
+        /// Trusted SHA-256 fingerprint of the AK public area
+        #[arg(long)]
+        ak_pub_sha256: String,
+
+        /// Expected PCR list (comma-separated, SHA-256 bank), e.g. 0,7
+        #[arg(long)]
+        pcrs: String,
     },
 
     /// Manage persistent TPM keys

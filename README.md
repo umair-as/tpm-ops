@@ -97,13 +97,42 @@ tpm-ops key delete 0x81000001
 tpm-ops seal "my-secret" --pcrs 0,7 --out sealed.blob
 tpm-ops unseal --in sealed.blob --pcrs 0,7
 
-# Attestation
-tpm-ops quote --pcrs 0,7 --out quote.blob
-tpm-ops quote-verify quote.blob
+# Attestation: the verifier supplies the challenge and expected PCR selection.
+tpm-ops quote --pcrs 0,7 --nonce <challenge-hex> --out quote.blob
+
+# Provision the printed "AK SHA-256" fingerprint through a trusted channel,
+# then require all three independent expectations during verification.
+tpm-ops quote-verify quote.blob \
+  --nonce <challenge-hex> \
+  --ak-pub-sha256 <trusted-ak-fingerprint> \
+  --pcrs 0,7
 
 # Software TPM (testing)
 tpm-ops --tcti "swtpm:port=2321" test
 ```
+
+### Quote trust model
+
+`quote-verify` deliberately does not trust the nonce, PCR label, or AK public
+key carried inside the quote blob. The verifier must provide:
+
+- the challenge nonce it issued;
+- the expected SHA-256 PCR selection; and
+- a SHA-256 fingerprint of the AK public area obtained through a trusted
+  provisioning channel.
+
+Challenge nonces must contain 16 to 64 bytes. When `--nonce` is omitted during
+quote generation, the TPM RNG is read until a complete 32-byte nonce is
+available.
+
+The current `quote` command creates an ephemeral AK, so its fingerprint changes
+for every quote. This is suitable for local round-trip diagnostics when the
+fingerprint is transferred over an authenticated channel. A production remote
+attestation deployment should provision and pin a stable AK identity.
+
+The hardware test suite reserves persistent handles `0x81000FFD` through
+`0x81000FFF`. It now refuses to run if any of those handles are occupied and
+never deletes a pre-existing key.
 
 ---
 
@@ -120,6 +149,30 @@ swtpm socket \
   --tpm2 --flags startup-clear --daemon
 
 tpm-ops --tcti "swtpm:port=2321" test
+```
+
+---
+
+## Supply-chain security
+
+`Cargo.lock` is committed so builds, audits, and SBOMs resolve the same dependency
+versions. CI performs the following checks:
+
+- RustSec vulnerability and informational-warning scanning on every push and
+  pull request, plus a weekly rescan for newly published advisories;
+- 90-day retention of the machine-readable RustSec JSON report;
+- CycloneDX 1.5 JSON SBOM generation with `cargo-cyclonedx`;
+- 90-day retention of the SBOM as a workflow artifact; and
+- a signed GitHub SBOM attestation for builds pushed to `main`.
+
+To reproduce the checks locally:
+
+```bash
+cargo install cargo-audit --version 0.22.2 --locked
+cargo audit --deny warnings
+
+cargo install cargo-cyclonedx --version 0.5.9 --locked
+cargo cyclonedx --format json --spec-version 1.5
 ```
 
 ---

@@ -101,23 +101,49 @@ pub(crate) fn cmd_selftest(context: &mut TpmContext, full: bool) -> Result<()> {
 }
 
 pub(crate) fn cmd_random(context: &mut TpmContext, num_bytes: usize) -> Result<()> {
+    let random_bytes = random_bytes(context, num_bytes)?;
+
+    println!("Random bytes ({} bytes):", random_bytes.len());
+    println!("{}", hex::encode(random_bytes));
+
+    Ok(())
+}
+
+pub(crate) fn random_bytes(context: &mut TpmContext, num_bytes: usize) -> Result<Vec<u8>> {
     if num_bytes == 0 || num_bytes > 48 {
         anyhow::bail!("Byte count must be between 1 and 48");
     }
 
     info!("Generating {} random bytes from TPM TRNG...", num_bytes);
 
-    let random_bytes = context
-        .get_random(num_bytes)
-        .context("Failed to get random bytes from TPM")?;
+    let mut output = Vec::with_capacity(num_bytes);
+    while output.len() < num_bytes {
+        let random = context
+            .get_random(num_bytes - output.len())
+            .context("Failed to get random bytes from TPM")?;
+        if random.is_empty() {
+            anyhow::bail!("TPM returned no random data");
+        }
+        output.extend_from_slice(random.value());
+    }
 
-    println!("Random bytes ({} bytes):", num_bytes);
-    println!("{}", hex::encode(random_bytes.value()));
-
-    Ok(())
+    Ok(output)
 }
 
 pub(crate) fn cmd_pcr(context: &mut TpmContext, index: u8, algo: &str) -> Result<()> {
+    let digests = read_pcr_digests(context, index, algo)?;
+    for digest in digests {
+        println!("PCR[{}] ({}):", index, algo.to_uppercase());
+        println!("{}", hex::encode(digest));
+    }
+    Ok(())
+}
+
+pub(crate) fn read_pcr_digests(
+    context: &mut TpmContext,
+    index: u8,
+    algo: &str,
+) -> Result<Vec<Vec<u8>>> {
     if index > 23 {
         anyhow::bail!("PCR index must be 0-23");
     }
@@ -141,15 +167,13 @@ pub(crate) fn cmd_pcr(context: &mut TpmContext, index: u8, algo: &str) -> Result
 
     let digests = digest_list.value();
     if digests.is_empty() {
-        println!("PCR[{}]: (empty)", index);
-    } else {
-        for digest in digests {
-            println!("PCR[{}] ({}):", index, algo.to_uppercase());
-            println!("{}", hex::encode(digest.value()));
-        }
+        anyhow::bail!("TPM returned no digest for PCR {}", index);
     }
 
-    Ok(())
+    Ok(digests
+        .iter()
+        .map(|digest| digest.value().to_vec())
+        .collect())
 }
 
 pub(crate) fn cmd_hash(context: &mut TpmContext, data: &str, algo: &str) -> Result<()> {
@@ -162,21 +186,28 @@ pub(crate) fn cmd_hash(context: &mut TpmContext, data: &str, algo: &str) -> Resu
         data.as_bytes().to_vec()
     };
 
-    let buffer =
-        MaxBuffer::try_from(data_bytes.as_slice()).context("Data too large for TPM buffer")?;
-
     info!(
         "Hashing {} bytes with {}...",
         data_bytes.len(),
         algo.to_uppercase()
     );
 
+    let digest = hash_bytes(context, &data_bytes, hash_algo)?;
+
+    println!("{} hash:", algo.to_uppercase());
+    println!("{}", hex::encode(digest));
+
+    Ok(())
+}
+
+pub(crate) fn hash_bytes(
+    context: &mut TpmContext,
+    data: &[u8],
+    hash_algo: tss_esapi::interface_types::algorithm::HashingAlgorithm,
+) -> Result<Vec<u8>> {
+    let buffer = MaxBuffer::try_from(data).context("Data too large for TPM buffer")?;
     let (digest, _ticket) = context
         .hash(buffer, hash_algo, Hierarchy::Null)
         .context("Failed to hash data")?;
-
-    println!("{} hash:", algo.to_uppercase());
-    println!("{}", hex::encode(digest.value()));
-
-    Ok(())
+    Ok(digest.value().to_vec())
 }

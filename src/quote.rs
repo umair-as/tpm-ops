@@ -22,9 +22,14 @@ use tss_esapi::{
     Context as TpmContext,
 };
 
-use crate::tpm::{create_srk, parse_pcr_indices, pcr_selection_sha256, KeyGuard};
+use crate::{
+    commands::random_bytes,
+    tpm::{create_srk, parse_pcr_indices, pcr_selection_sha256, KeyGuard},
+};
 
 const QUOTE_BLOB_MAGIC: &str = "TPM_OPS_QUOTE_V1";
+const MIN_NONCE_BYTES: usize = 16;
+const DEFAULT_NONCE_BYTES: usize = 32;
 
 struct QuoteBlob {
     algo: String,
@@ -86,6 +91,47 @@ impl QuoteBlob {
             ak_pub_hex: field!("ak_pub"),
         })
     }
+}
+
+fn normalize_sha256_hex(value: &str, field: &str) -> Result<String> {
+    let bytes = hex::decode(value.trim()).with_context(|| format!("Invalid {field} hex"))?;
+    if bytes.len() != 32 {
+        anyhow::bail!("{field} must be 32 bytes, got {}", bytes.len());
+    }
+    Ok(hex::encode(bytes))
+}
+
+fn validate_nonce(nonce: Vec<u8>, field: &str) -> Result<Vec<u8>> {
+    if nonce.len() < MIN_NONCE_BYTES {
+        anyhow::bail!(
+            "{field} must be at least {MIN_NONCE_BYTES} bytes, got {}",
+            nonce.len()
+        );
+    }
+    if nonce.len() > 64 {
+        anyhow::bail!("{field} must be at most 64 bytes, got {}", nonce.len());
+    }
+    Ok(nonce)
+}
+
+fn ak_public_fingerprint(context: &mut TpmContext, public_bytes: &[u8]) -> Result<String> {
+    let buffer =
+        MaxBuffer::try_from(public_bytes).context("AK public area is too large to fingerprint")?;
+    let (digest, _) = context
+        .hash(buffer, HashingAlgorithm::Sha256, Hierarchy::Null)
+        .context("Failed to fingerprint AK public area")?;
+    Ok(hex::encode(digest.value()))
+}
+
+pub(crate) fn quote_public_fingerprint_from_file(
+    context: &mut TpmContext,
+    in_path: &str,
+) -> Result<String> {
+    let raw = fs::read_to_string(Path::new(in_path))
+        .with_context(|| format!("Failed to read quote blob from {}", in_path))?;
+    let blob = QuoteBlob::parse(&raw)?;
+    let public_bytes = hex::decode(&blob.ak_pub_hex).context("Invalid ak_pub hex in blob")?;
+    ak_public_fingerprint(context, &public_bytes)
 }
 
 /// Create an ephemeral restricted RSA signing key (AK) under the SRK.
@@ -253,19 +299,27 @@ pub(crate) fn cmd_quote(
         .join(",");
     let pcr_selection = pcr_selection_sha256(&pcr_indices)?;
 
-    // Nonce: provided hex or freshly generated 32 random bytes.
+    // Nonce: verifier-provided hex or exactly 32 fresh random bytes.
     let nonce_bytes: Vec<u8> = match nonce_opt {
-        Some(hex_str) => hex::decode(hex_str).context("Invalid nonce hex")?,
-        None => {
-            let rand = context.get_random(32).context("Failed to generate nonce")?;
-            rand.value().to_vec()
+        Some(hex_str) => {
+            validate_nonce(hex::decode(hex_str).context("Invalid nonce hex")?, "Nonce")?
         }
+        None => random_bytes(context, DEFAULT_NONCE_BYTES)
+            .context("Failed to generate a complete nonce")?,
     };
     let qualifying_data =
         Data::try_from(nonce_bytes.as_slice()).context("Nonce too large (max 64 bytes)")?;
     let nonce_hex = hex::encode(&nonce_bytes);
 
-    let is_ecc = matches!(algo.to_lowercase().as_str(), "ecc");
+    let normalized_algo = algo.to_lowercase();
+    let is_ecc = match normalized_algo.as_str() {
+        "rsa" => false,
+        "ecc" => true,
+        _ => anyhow::bail!(
+            "Unsupported quote algorithm: {} (expected rsa or ecc)",
+            algo
+        ),
+    };
 
     info!("Creating ephemeral {} AK under SRK...", algo.to_uppercase());
     let srk = create_srk(context)?;
@@ -298,18 +352,20 @@ pub(crate) fn cmd_quote(
     let sig_hex = sig_to_hex(&signature)?;
     let ak_pub_buffer = PublicBuffer::try_from(ak_pub).context("Failed to encode AK public")?;
     let ak_pub_hex = hex::encode(ak_pub_buffer.value());
+    let ak_pub_sha256 = ak_public_fingerprint(ak_guard.context, ak_pub_buffer.value())?;
 
     // Print summary.
     println!("PCRs:        SHA-256:{}", pcrs_normalized);
     println!("Nonce:       {}", nonce_hex);
     println!("Algo:        {}", algo.to_uppercase());
+    println!("AK SHA-256:  {}", ak_pub_sha256);
     println!("Firmware:    0x{:016X}", attest.firmware_version());
     if let AttestInfo::Quote { info } = attest.attested() {
         println!("PCR digest:  {}", hex::encode(info.pcr_digest().value()));
     }
 
     let blob = QuoteBlob {
-        algo: algo.to_lowercase(),
+        algo: normalized_algo,
         pcrs: pcrs_normalized,
         nonce_hex,
         attest_hex: hex::encode(&attest_bytes),
@@ -337,11 +393,35 @@ pub(crate) fn cmd_quote(
 ///
 /// The AK public key stored in the blob is loaded as an external key. The
 /// TPMS_ATTEST bytes are hashed and the signature is verified against them.
-pub(crate) fn cmd_quote_verify(context: &mut TpmContext, in_path: &str) -> Result<()> {
+pub(crate) fn cmd_quote_verify(
+    context: &mut TpmContext,
+    in_path: &str,
+    expected_nonce_hex: &str,
+    expected_ak_pub_sha256: &str,
+    expected_pcrs: &str,
+) -> Result<()> {
     let raw = fs::read_to_string(Path::new(in_path))
         .with_context(|| format!("Failed to read quote blob from {}", in_path))?;
     let blob = QuoteBlob::parse(&raw)?;
-    let is_ecc = blob.algo == "ecc";
+    let is_ecc = match blob.algo.as_str() {
+        "rsa" => false,
+        "ecc" => true,
+        other => anyhow::bail!("Unsupported quote algorithm in blob: {}", other),
+    };
+
+    let expected_nonce = validate_nonce(
+        hex::decode(expected_nonce_hex.trim()).context("Invalid expected nonce hex")?,
+        "Expected nonce",
+    )?;
+    let expected_ak_pub_sha256 =
+        normalize_sha256_hex(expected_ak_pub_sha256, "Expected AK fingerprint")?;
+    let expected_pcr_indices = parse_pcr_indices(expected_pcrs)?;
+    let expected_pcr_selection = pcr_selection_sha256(&expected_pcr_indices)?;
+    let expected_pcrs_normalized = expected_pcr_indices
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
 
     // Decode and parse the TPMS_ATTEST structure.
     let attest_bytes = hex::decode(&blob.attest_hex).context("Invalid attest hex in blob")?;
@@ -360,6 +440,14 @@ pub(crate) fn cmd_quote_verify(context: &mut TpmContext, in_path: &str) -> Resul
 
     // Load the AK public key as an external object (no hierarchy binding needed).
     let ak_pub_bytes = hex::decode(&blob.ak_pub_hex).context("Invalid ak_pub hex in blob")?;
+    let actual_ak_pub_sha256 = ak_public_fingerprint(context, &ak_pub_bytes)?;
+    if actual_ak_pub_sha256 != expected_ak_pub_sha256 {
+        anyhow::bail!(
+            "AK public key fingerprint mismatch: expected {}, got {}",
+            expected_ak_pub_sha256,
+            actual_ak_pub_sha256
+        );
+    }
     let ak_pub_buffer =
         PublicBuffer::try_from(ak_pub_bytes).context("Failed to decode AK public buffer")?;
     let ak_pub = Public::try_from(ak_pub_buffer).context("Failed to decode AK public area")?;
@@ -372,20 +460,40 @@ pub(crate) fn cmd_quote_verify(context: &mut TpmContext, in_path: &str) -> Resul
     // Best-effort flush — ignore error since the context will flush on drop anyway.
     let _ = context.flush_context(ak_ext.into());
 
-    match verify_result {
-        Ok(_) => println!("Signature:   VALID [OK]"),
-        Err(e) => anyhow::bail!("Quote signature verification FAILED: {}", e),
+    if let Err(error) = verify_result {
+        anyhow::bail!("Quote signature verification FAILED: {}", error);
     }
 
     // Display attested fields.
+    if attest.extra_data().value() != expected_nonce.as_slice() {
+        anyhow::bail!("Quote nonce does not match the verifier's expected nonce");
+    }
     let stored_nonce = hex::decode(&blob.nonce_hex).context("Invalid nonce in blob")?;
-    if attest.extra_data().value() != stored_nonce.as_slice() {
-        anyhow::bail!("Nonce mismatch between attest structure and blob nonce field");
+    if stored_nonce != expected_nonce {
+        anyhow::bail!("Quote blob nonce metadata does not match the verifier's expected nonce");
     }
 
+    let quote_info = match attest.attested() {
+        AttestInfo::Quote { info } => info,
+        _ => anyhow::bail!("Signed attestation is not a TPM quote"),
+    };
+    if quote_info.pcr_selection() != &expected_pcr_selection {
+        anyhow::bail!("Signed PCR selection does not match the verifier's expected PCR selection");
+    }
+    if blob.pcrs != expected_pcrs_normalized {
+        anyhow::bail!(
+            "Quote blob PCR metadata does not match the verifier's expected PCR selection"
+        );
+    }
+
+    println!("Signature:   VALID [OK]");
     println!("\n--- Attested State ---");
-    println!("PCRs:        SHA-256:{}", blob.pcrs);
-    println!("Nonce:       {} (verified)", blob.nonce_hex);
+    println!(
+        "PCRs:        SHA-256:{} (verified)",
+        expected_pcrs_normalized
+    );
+    println!("Nonce:       {} (verified)", hex::encode(expected_nonce));
+    println!("AK SHA-256:  {} (trusted)", actual_ak_pub_sha256);
     println!(
         "Clock:       {} ms  (resets={}, restarts={})",
         attest.clock_info().clock(),
@@ -393,10 +501,55 @@ pub(crate) fn cmd_quote_verify(context: &mut TpmContext, in_path: &str) -> Resul
         attest.clock_info().restart_count(),
     );
     println!("Firmware:    0x{:016X}", attest.firmware_version());
-    if let AttestInfo::Quote { info } = attest.attested() {
-        println!("PCR digest:  {}", hex::encode(info.pcr_digest().value()));
-    }
+    println!(
+        "PCR digest:  {}",
+        hex::encode(quote_info.pcr_digest().value())
+    );
 
     println!("\nQuote verify [OK]");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_sha256_hex, validate_nonce};
+
+    #[test]
+    fn sha256_fingerprint_is_normalized() {
+        let uppercase = "AA".repeat(32);
+        assert_eq!(
+            normalize_sha256_hex(&uppercase, "fingerprint").unwrap(),
+            "aa".repeat(32)
+        );
+    }
+
+    #[test]
+    fn sha256_fingerprint_rejects_wrong_length() {
+        let error = normalize_sha256_hex("abcd", "fingerprint").unwrap_err();
+        assert!(error.to_string().contains("must be 32 bytes"));
+    }
+
+    #[test]
+    fn sha256_fingerprint_rejects_non_hex_input() {
+        let error = normalize_sha256_hex(&"zz".repeat(32), "fingerprint").unwrap_err();
+        assert!(error.to_string().contains("Invalid fingerprint hex"));
+    }
+
+    #[test]
+    fn nonce_rejects_values_shorter_than_128_bits() {
+        let error = validate_nonce(vec![0; 15], "Nonce").unwrap_err();
+        assert!(error.to_string().contains("at least 16 bytes"));
+    }
+
+    #[test]
+    fn nonce_accepts_128_to_512_bits() {
+        assert_eq!(validate_nonce(vec![0; 16], "Nonce").unwrap().len(), 16);
+        assert_eq!(validate_nonce(vec![0; 64], "Nonce").unwrap().len(), 64);
+    }
+
+    #[test]
+    fn nonce_rejects_values_larger_than_tpm2b_data() {
+        let error = validate_nonce(vec![0; 65], "Nonce").unwrap_err();
+        assert!(error.to_string().contains("at most 64 bytes"));
+    }
 }
