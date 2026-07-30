@@ -1,9 +1,9 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tss_esapi::{interface_types::algorithm::HashingAlgorithm, Context as TpmContext};
 
 use crate::commands::{
-    cmd_hash, cmd_info, cmd_pcr, cmd_random, cmd_selftest, hash_bytes, random_bytes,
-    read_pcr_digests,
+    cmd_hash, cmd_info, cmd_pcr, cmd_random, cmd_selftest, hash_bytes, pcr_extend, pcr_reset,
+    random_bytes, read_pcr_digests,
 };
 use crate::keys::{cmd_key_create, cmd_key_delete};
 use crate::quote::{cmd_quote, cmd_quote_verify, quote_public_fingerprint_from_file};
@@ -52,11 +52,11 @@ pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
     println!();
 
     println!("--- Test 6: RSA Signing (ephemeral) ---");
-    cmd_sign(context, "Test message for RSA signing", false, None)?;
+    cmd_sign(context, "Test message for RSA signing", false, None, None)?;
     println!();
 
     println!("--- Test 7: ECC Signing (ephemeral) ---");
-    cmd_sign(context, "Test message for ECC signing", true, None)?;
+    cmd_sign(context, "Test message for ECC signing", true, None, None)?;
     println!();
 
     println!("--- Test 8: Persistent Key Lifecycle ---");
@@ -73,6 +73,10 @@ pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
 
     println!("--- Test 11: TPM Quote + Verify ---");
     cmd_test_quote(context)?;
+    println!();
+
+    println!("--- Test 12: Policy-Bound Key (PCR Policy Session) ---");
+    cmd_test_policy_bound_key(context)?;
     println!();
 
     println!("=== All Tests Passed! ===");
@@ -93,11 +97,17 @@ fn cmd_test_persistent_key(context: &mut TpmContext) -> Result<()> {
     }
 
     println!("  Creating test RSA key...");
-    cmd_key_create(context, "rsa", test_handle)?;
+    cmd_key_create(context, "rsa", test_handle, None)?;
 
     let test_result = {
         println!("  Signing with persistent key...");
-        cmd_sign(context, "persistent-key-test", false, Some(test_handle))
+        cmd_sign(
+            context,
+            "persistent-key-test",
+            false,
+            Some(test_handle),
+            None,
+        )
     };
 
     println!("  Deleting test key...");
@@ -124,11 +134,11 @@ fn cmd_test_sign_verify(context: &mut TpmContext) -> Result<()> {
         }
 
         println!("  Creating test {} key...", algo.to_uppercase());
-        cmd_key_create(context, algo, handle_str)?;
+        cmd_key_create(context, algo, handle_str, None)?;
 
         let test_result = (|| {
             println!("  Signing...");
-            let (_, _, sig_bytes) = sign_with_persistent_key(context, test_data, handle_str)?;
+            let (_, _, sig_bytes) = sign_with_persistent_key(context, test_data, handle_str, None)?;
             let sig_hex = hex::encode(&sig_bytes);
 
             println!("  Verifying...");
@@ -193,6 +203,41 @@ fn cmd_test_seal_unseal(context: &mut TpmContext) -> Result<()> {
 
     let cleanup_result = remove_test_file(&path);
     combine_test_and_cleanup(test_result, cleanup_result, &path)?;
+
+    // Real negative: an actual PCR state change (not just a client-rejected wrong
+    // selection) must also invalidate an outstanding seal.
+    let path23 = format!("/tmp/tpm-ops-sealed-test-pcr23-{}.blob", std::process::id());
+    let payload23 = "sealed-real-pcr-change-test";
+
+    let test_result_23 = (|| {
+        println!("  Resetting PCR 23 to establish a known baseline...");
+        pcr_reset(context, 23)?;
+
+        println!("  Sealing test payload to PCR 23...");
+        cmd_seal(context, payload23, "23", &path23)?;
+
+        println!("  Extending PCR 23 (real state change)...");
+        pcr_extend(context, 23, b"tamper-seal")?;
+
+        println!("  Unsealing after PCR 23 changed (should fail)...");
+        let error = match unseal_from_file(context, &path23, "23") {
+            Ok(_) => anyhow::bail!("Unseal succeeded after PCR 23 state changed"),
+            Err(error) => error,
+        };
+        if !error.to_string().contains("does not satisfy blob policy") {
+            anyhow::bail!(
+                "Post-extend unseal test failed for an unexpected reason: {:#}",
+                error
+            );
+        }
+        println!("  Unseal correctly rejected after real PCR 23 change [OK]");
+        Ok(())
+    })();
+
+    let cleanup_result_23 =
+        remove_test_file(&path23).and_then(|()| pcr_reset(context, 23).map(|_| ()));
+    combine_test_and_cleanup(test_result_23, cleanup_result_23, &path23)?;
+
     println!("\nSeal + Unseal roundtrip [OK]");
     Ok(())
 }
@@ -266,6 +311,89 @@ fn cmd_test_quote(context: &mut TpmContext) -> Result<()> {
     let cleanup_result = remove_test_file(&path);
     combine_test_and_cleanup(test_result, cleanup_result, &path)?;
     println!("\nTPM Quote + Verify roundtrip [OK]");
+    Ok(())
+}
+
+/// Test a PCR-policy-bound signing key: sign succeeds while PCR 23 matches the
+/// state captured at key-creation time, fails after a real `pcr extend`, and
+/// succeeds again after `pcr reset` — proving the gate is state-driven, not a
+/// one-way latch. Also re-signs several times in this one process, which is
+/// where a session leak in T1's PolicyPCR plumbing would show up on real
+/// hardware (swtpm is more forgiving of leaked session slots).
+fn cmd_test_policy_bound_key(context: &mut TpmContext) -> Result<()> {
+    let test_handle = "0x81000FFC";
+    let test_handle_val: u32 = 0x81000FFC;
+    let test_data = "policy-bound-sign-test";
+
+    if persistent_handle_exists(context, test_handle_val)? {
+        anyhow::bail!(
+            "Test handle {} is occupied; refusing to delete an unverified persistent key",
+            test_handle
+        );
+    }
+
+    let test_result = (|| {
+        println!("  Resetting PCR 23 to establish a known baseline...");
+        let baseline = pcr_reset(context, 23)?;
+        println!("  PCR 23 baseline: {}", hex::encode(&baseline));
+
+        println!("  Creating policy-bound ECC key (PCR 23)...");
+        cmd_key_create(context, "ecc", test_handle, Some("23"))?;
+
+        println!("  Signing with matching PCR policy (should succeed)...");
+        let (_, _, sig_bytes) =
+            sign_with_persistent_key(context, test_data, test_handle, Some("23"))?;
+        let sig_hex = hex::encode(&sig_bytes);
+
+        println!("  Verifying signature round-trips...");
+        cmd_verify(context, test_data, test_handle, &sig_hex)?;
+
+        println!("  Signing 5 more times in this process (session-leak check)...");
+        for attempt in 1..=5 {
+            sign_with_persistent_key(context, test_data, test_handle, Some("23")).with_context(
+                || {
+                    format!(
+                        "Repeat policy sign #{} failed (possible session leak)",
+                        attempt
+                    )
+                },
+            )?;
+        }
+        println!("  5 consecutive policy signs succeeded [OK]");
+
+        println!("  Extending PCR 23 (real state change)...");
+        pcr_extend(context, 23, b"tamper-policy-key")?;
+
+        println!("  Signing after PCR 23 changed (should fail)...");
+        let error = match sign_with_persistent_key(context, test_data, test_handle, Some("23")) {
+            Ok(_) => anyhow::bail!("Sign succeeded after PCR 23 state changed"),
+            Err(error) => error,
+        };
+        let expected_prefix =
+            "Sign refused by TPM: current PCR state does not satisfy the key's policy";
+        if !error.to_string().starts_with(expected_prefix) {
+            anyhow::bail!(
+                "Post-extend sign test failed for an unexpected reason: {:#}",
+                error
+            );
+        }
+        println!("  Sign correctly rejected after real PCR 23 change [OK]");
+
+        println!("  Resetting PCR 23 and signing again (should succeed)...");
+        pcr_reset(context, 23)?;
+        sign_with_persistent_key(context, test_data, test_handle, Some("23"))
+            .context("Sign failed after PCR 23 was reset back to baseline")?;
+        println!("  Sign correctly succeeds again after reset [OK]");
+
+        Ok(())
+    })();
+
+    println!("  Deleting test key...");
+    let cleanup_result =
+        cmd_key_delete(context, test_handle).and_then(|()| pcr_reset(context, 23).map(|_| ()));
+    combine_test_and_cleanup(test_result, cleanup_result, test_handle)?;
+
+    println!("\nPolicy-bound key [OK]");
     Ok(())
 }
 
