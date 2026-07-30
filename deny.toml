@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: MIT
+#
+# Dependency policy enforced by .github/workflows/dependency-security.yml.
+# RustSec advisories are checked separately by cargo-audit (see ci.yml);
+# cargo-deny covers license, duplicate-dependency, and source policy without
+# duplicating that network-backed advisory lookup.
+
+[graph]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.8
+# Exactly the licenses in the current resolved graph. Kept tight on purpose:
+# a dependency that introduces a new license should trip this check and get a
+# deliberate review before it is added, rather than being pre-authorized.
+# "Apache-2.0 WITH LLVM-exception" (target-lexicon, via tss-esapi-sys) and
+# "Unicode-3.0" (unicode-ident, via proc-macro2) are distinct SPDX expressions
+# from plain Apache-2.0/MIT, so each needs its own explicit allow entry.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

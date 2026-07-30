@@ -68,6 +68,12 @@ qemu-aarch64-static -L /path/to/aarch64-sysroot \
   target/aarch64-unknown-linux-gnu/release/tpm-ops version
 ```
 
+CI cross-builds for aarch64 on every push/PR to `main` (the "Cross-build (aarch64)" job), using
+option 1 above (arm64 multiarch packages) plus the same `qemu-aarch64-static` smoke check. It
+compiles and links only — a GitHub-hosted runner can't execute an aarch64 binary natively beyond
+that emulated smoke step — but that's enough to catch a dependency or code change that breaks the
+cross build before it's discovered by hand at deploy time.
+
 ## Testing with swtpm
 
 No hardware TPM needed for development:
@@ -98,7 +104,9 @@ restarting the simulator entirely.
 
 `Cargo.lock` is committed so builds, audits, and SBOMs resolve the same dependency versions. CI
 runs RustSec vulnerability scanning and CycloneDX SBOM generation on every push and PR (plus a
-weekly rescan for newly published advisories). To reproduce locally:
+weekly rescan for newly published advisories), and a separate license/source/duplicate-dependency
+policy check ([`deny.toml`](../deny.toml)) whenever `Cargo.toml`/`Cargo.lock`/`deny.toml` change.
+To reproduce locally:
 
 ```bash
 cargo install cargo-audit --version 0.22.2 --locked
@@ -106,7 +114,35 @@ cargo audit --deny warnings
 
 cargo install cargo-cyclonedx --version 0.5.9 --locked
 cargo cyclonedx --format json --spec-version 1.5
+
+cargo install cargo-deny --locked
+cargo deny check bans licenses sources
 ```
+
+`deny.toml`'s license allow-list is deliberately exact, not broad — a dependency that introduces
+a license not already in the list should fail the check and get a deliberate look, rather than
+being pre-authorized by a wildcard.
+
+## Changelog
+
+[`CHANGELOG.md`](../CHANGELOG.md) is generated from the git history with
+[git-cliff](https://github.com/orhun/git-cliff) and [`cliff.toml`](../cliff.toml) — **it is never
+hand-edited.** The commit history is Conventional Commits (`feat:`, `fix:`, `docs:`, etc.), so
+`cliff.toml` classifies mostly by commit type, with a keyword match that routes
+security/hardening-flavored commits (matching `security`, `harden`, `hardening`, or `cve`
+case-insensitively) into their own section even without a conventional prefix, and a catch-all
+group so anything else still shows up rather than silently disappearing.
+
+There is no GitHub Releases flow and no CI automation for this — regeneration is a manual step,
+done once per version bump:
+
+```bash
+GITHUB_REPO=umair-as/tpm-ops git-cliff --config cliff.toml --tag v<new-version> -o CHANGELOG.md
+```
+
+Run it *after* bumping `Cargo.toml`'s version but *before* tagging, so the new section's heading
+(`v<new-version>`) matches the tag you're about to create. Commit the regenerated
+`CHANGELOG.md` alongside the version bump.
 
 ## Hardware
 

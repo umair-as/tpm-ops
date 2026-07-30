@@ -9,5 +9,5 @@
 - **[security-model.md](security-model.md)** — what the tool protects against and what it
   doesn't, the quote trust model, the `pcr extend`/`reset` safety rule, and an honest limitations
   section. Read this before relying on any of this for something that matters.
-- **[building.md](building.md)** — native build, aarch64 cross-compiling via a sysroot, and
-  testing against `swtpm`.
+- **[building.md](building.md)** — native build, aarch64 cross-compiling via a sysroot, testing
+  against `swtpm`, and regenerating [`../CHANGELOG.md`](../CHANGELOG.md).

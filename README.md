@@ -41,8 +41,11 @@ Start with **[docs/](docs/)**:
 - [docs/security-model.md](docs/security-model.md) — what the tool protects against and what it
   doesn't, including an honest limitations section. Read this before relying on any of this for
   something that matters.
-- [docs/building.md](docs/building.md) — native build, aarch64 cross-compiling via a sysroot, and
-  testing against `swtpm`.
+- [docs/building.md](docs/building.md) — native build, aarch64 cross-compiling via a sysroot,
+  testing against `swtpm`, and regenerating the changelog.
+
+See [CHANGELOG.md](CHANGELOG.md) for what changed between versions — generated from git history,
+never hand-edited (see [docs/building.md](docs/building.md#changelog)).
 
 ## Hardware
 
