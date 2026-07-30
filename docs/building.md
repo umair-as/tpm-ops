@@ -104,7 +104,9 @@ restarting the simulator entirely.
 
 `Cargo.lock` is committed so builds, audits, and SBOMs resolve the same dependency versions. CI
 runs RustSec vulnerability scanning and CycloneDX SBOM generation on every push and PR (plus a
-weekly rescan for newly published advisories). To reproduce locally:
+weekly rescan for newly published advisories), and a separate license/source/duplicate-dependency
+policy check ([`deny.toml`](../deny.toml)) whenever `Cargo.toml`/`Cargo.lock`/`deny.toml` change.
+To reproduce locally:
 
 ```bash
 cargo install cargo-audit --version 0.22.2 --locked
@@ -112,7 +114,14 @@ cargo audit --deny warnings
 
 cargo install cargo-cyclonedx --version 0.5.9 --locked
 cargo cyclonedx --format json --spec-version 1.5
+
+cargo install cargo-deny --locked
+cargo deny check bans licenses sources
 ```
+
+`deny.toml`'s license allow-list is deliberately exact, not broad — a dependency that introduces
+a license not already in the list should fail the check and get a deliberate look, rather than
+being pre-authorized by a wildcard.
 
 ## Changelog
 

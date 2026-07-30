@@ -1,0 +1,39 @@
+name: dependency-security
+
+# GitHub Actions requires the YAML 1.1 boolean-like key `on`.
+# yamllint disable-line rule:truthy
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/dependency-security.yml"
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/dependency-security.yml"
+  schedule:
+    # Re-check license/source/duplicate-dependency policy when it drifts,
+    # independent of the RustSec advisory rescan already in ci.yml.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      # EmbarkStudios/cargo-deny-action v2.0.18
+      - uses: EmbarkStudios/cargo-deny-action@6c8f9facfa5047ec02d8485b6bf52b587b7777d1
+        with:
+          command: check bans licenses sources
