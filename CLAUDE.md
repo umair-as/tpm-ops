@@ -14,7 +14,7 @@ cargo build --release
 
 # Cross-compile for an aarch64 target (needs an aarch64 sysroot with libtss2)
 SYSROOT=/path/to/aarch64-sysroot ./scripts/cross-build-aarch64.sh
-# See README "Cross-compiling for aarch64" for how to obtain a sysroot.
+# See docs/building.md "Cross-compiling for aarch64" for how to obtain a sysroot.
 
 # Lint / format — CI enforces both strictly (see note below)
 cargo fmt --check
@@ -62,7 +62,7 @@ The global `--tcti` flag selects the transport for every command; it defaults to
 
 **On-disk blob formats.** `seal` and `quote` write plain-text `key=value` files with a magic first line (`TPM_OPS_SEALED_V1`, `TPM_OPS_QUOTE_V1`). Parsers reject on a wrong magic and on any missing field. If you add a field, bump the magic version.
 
-**Quote trust model (important, see README "Quote trust model").** `quote-verify` deliberately does **not** trust the nonce, PCR label, or AK public key carried inside the blob. The verifier must independently supply `--nonce`, `--pcrs`, and `--ak-pub-sha256` (a fingerprint provisioned over a trusted channel). Verification cross-checks the signed `TPMS_ATTEST` against all three, and also checks the blob's own metadata matches — do not "simplify" by trusting blob-internal values. The current `quote` command creates an *ephemeral* AK (fingerprint changes every run), suitable for local round-trip diagnostics; production remote attestation needs a pinned, provisioned AK.
+**Quote trust model (important, see docs/security-model.md "Quote trust model").** `quote-verify` deliberately does **not** trust the nonce, PCR label, or AK public key carried inside the blob. The verifier must independently supply `--nonce`, `--pcrs`, and `--ak-pub-sha256` (a fingerprint provisioned over a trusted channel). Verification cross-checks the signed `TPMS_ATTEST` against all three, and also checks the blob's own metadata matches — do not "simplify" by trusting blob-internal values. The current `quote` command creates an *ephemeral* AK (fingerprint changes every run), suitable for local round-trip diagnostics; production remote attestation needs a pinned, provisioned AK.
 
 **PEM export** (`pem.rs`) hand-encodes DER for RSA (`RSA PUBLIC KEY`) and ECC (`PUBLIC KEY` / SubjectPublicKeyInfo) public areas read back from persistent keys.
 
