@@ -71,6 +71,32 @@ jobs:
       - name: Install aarch64 cross toolchain and sysroot packages
         run: |
           sudo dpkg --add-architecture arm64
+
+          # GitHub-hosted runners' default mirrors (notably security.ubuntu.com)
+          # don't carry non-native architectures, so a plain `apt-get update`
+          # 404s on arm64 indices once the foreign architecture is added.
+          # Restrict the runner's existing sources to its native architecture
+          # and add a dedicated arm64 source pointed at the official ports
+          # mirror, which does carry it.
+          native_arch="$(dpkg --print-architecture)"
+          for f in /etc/apt/sources.list.d/*.sources; do
+            [ -e "$f" ] || continue
+            sudo sed -i "/^Types:/a Architectures: ${native_arch}" "$f"
+          done
+          if [ -e /etc/apt/sources.list ]; then
+            sudo sed -i "s/^deb \(http\|mirror\)/deb [arch=${native_arch}] \1/" /etc/apt/sources.list
+          fi
+
+          . /etc/os-release
+          sudo tee /etc/apt/sources.list.d/arm64-ports.sources >/dev/null <<EOF
+          Types: deb
+          URIs: http://ports.ubuntu.com/ubuntu-ports
+          Suites: ${VERSION_CODENAME} ${VERSION_CODENAME}-updates ${VERSION_CODENAME}-security ${VERSION_CODENAME}-backports
+          Components: main universe restricted multiverse
+          Architectures: arm64
+          Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+          EOF
+
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu \
