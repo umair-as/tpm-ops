@@ -7,3 +7,4 @@ scripts/deploy-tpm-ops-target.sh
 # Local run/evidence logs — device-specific, not part of the project
 /logs
 .codex
+/scratch
