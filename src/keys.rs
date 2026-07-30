@@ -14,16 +14,17 @@ use tss_esapi::{
         session_handles::AuthSession,
     },
     structures::{
-        CapabilityData, EccPoint, EccScheme, HashScheme, KeyDerivationFunctionScheme, Public,
-        PublicBuilder, PublicEccParametersBuilder, PublicKeyRsa, PublicRsaParametersBuilder,
-        RsaExponent, RsaScheme,
+        CapabilityData, Digest, EccPoint, EccScheme, HashScheme, KeyDerivationFunctionScheme,
+        Public, PublicBuilder, PublicEccParametersBuilder, PublicKeyRsa,
+        PublicRsaParametersBuilder, RsaExponent, RsaScheme,
     },
     Context as TpmContext,
 };
 
 use crate::pem::{der_to_pem, encode_ec_pubkey_der, encode_rsa_pubkey_der};
 use crate::tpm::{
-    create_srk, parse_handle, persistent_handle_exists, persistent_to_esys, PERSISTENT_SRK_HANDLE,
+    create_srk, parse_handle, parse_pcr_indices, pcr_policy_digest, pcr_selection_sha256,
+    persistent_handle_exists, persistent_to_esys, PERSISTENT_SRK_HANDLE,
 };
 
 fn pad_ec_coordinate(value: &[u8], coordinate_size: usize) -> Result<Vec<u8>> {
@@ -40,14 +41,22 @@ fn pad_ec_coordinate(value: &[u8], coordinate_size: usize) -> Result<Vec<u8>> {
 }
 
 /// Build a public template for an unrestricted signing child key.
-fn signing_key_template(algo: &str) -> Result<Public> {
+///
+/// When `policy_digest` is `Some`, the key is bound to a PolicyPCR auth policy
+/// computed at creation time: password auth is disabled (`user_with_auth(false)`)
+/// and policy auth is required (`admin_with_policy(true)`), mirroring
+/// `sealed_public()` in `seal.rs`. Without it, behavior is unchanged from before
+/// policy-bound keys existed (plain password-authorized signing key).
+fn signing_key_template(algo: &str, policy_digest: Option<Digest>) -> Result<Public> {
+    let is_policy_bound = policy_digest.is_some();
     match algo.to_lowercase().as_str() {
         "rsa" => {
             let attrs = ObjectAttributesBuilder::new()
                 .with_fixed_tpm(true)
                 .with_fixed_parent(true)
                 .with_sensitive_data_origin(true)
-                .with_user_with_auth(true)
+                .with_user_with_auth(!is_policy_bound)
+                .with_admin_with_policy(is_policy_bound)
                 .with_sign_encrypt(true)
                 .with_restricted(false)
                 .build()
@@ -63,12 +72,16 @@ fn signing_key_template(algo: &str) -> Result<Public> {
                 .build()
                 .context("Failed to build RSA parameters")?;
 
-            PublicBuilder::new()
+            let mut builder = PublicBuilder::new()
                 .with_public_algorithm(PublicAlgorithm::Rsa)
                 .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
                 .with_object_attributes(attrs)
                 .with_rsa_parameters(rsa_params)
-                .with_rsa_unique_identifier(PublicKeyRsa::default())
+                .with_rsa_unique_identifier(PublicKeyRsa::default());
+            if let Some(digest) = policy_digest {
+                builder = builder.with_auth_policy(digest);
+            }
+            builder
                 .build()
                 .context("Failed to build RSA public template")
         }
@@ -77,7 +90,8 @@ fn signing_key_template(algo: &str) -> Result<Public> {
                 .with_fixed_tpm(true)
                 .with_fixed_parent(true)
                 .with_sensitive_data_origin(true)
-                .with_user_with_auth(true)
+                .with_user_with_auth(!is_policy_bound)
+                .with_admin_with_policy(is_policy_bound)
                 .with_sign_encrypt(true)
                 .with_restricted(false)
                 .build()
@@ -93,12 +107,16 @@ fn signing_key_template(algo: &str) -> Result<Public> {
                 .build()
                 .context("Failed to build ECC parameters")?;
 
-            PublicBuilder::new()
+            let mut builder = PublicBuilder::new()
                 .with_public_algorithm(PublicAlgorithm::Ecc)
                 .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
                 .with_object_attributes(attrs)
                 .with_ecc_parameters(ecc_params)
-                .with_ecc_unique_identifier(EccPoint::default())
+                .with_ecc_unique_identifier(EccPoint::default());
+            if let Some(digest) = policy_digest {
+                builder = builder.with_auth_policy(digest);
+            }
+            builder
                 .build()
                 .context("Failed to build ECC public template")
         }
@@ -107,10 +125,17 @@ fn signing_key_template(algo: &str) -> Result<Public> {
 }
 
 /// Create a child signing key under the SRK and persist it.
+///
+/// `policy_pcrs`, if given (e.g. "0,7"), binds the key's auth policy to the
+/// current value of those PCRs via a trial PolicyPCR session — the same
+/// machinery `seal.rs` uses for data. The PCR list is not recoverable from the
+/// key afterward (a policy digest is one-way): the caller must remember and
+/// re-supply the same list at sign time.
 pub(crate) fn cmd_key_create(
     context: &mut TpmContext,
     algo: &str,
     persist_str: &str,
+    policy_pcrs: Option<&str>,
 ) -> Result<()> {
     let handle_val = parse_handle(persist_str)?;
 
@@ -130,11 +155,27 @@ pub(crate) fn cmd_key_create(
         );
     }
 
+    let policy = match policy_pcrs {
+        Some(pcrs) => {
+            let indices = parse_pcr_indices(pcrs)?;
+            let pcrs_normalized = indices
+                .iter()
+                .map(u8::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let selection = pcr_selection_sha256(&indices)?;
+            let digest = pcr_policy_digest(context, selection)?;
+            Some((pcrs_normalized, digest))
+        }
+        None => None,
+    };
+
     info!("Creating {} child key under SRK...", algo.to_uppercase());
 
     let srk_handle = create_srk(context)?;
 
-    let child_template = signing_key_template(algo)?;
+    let policy_digest = policy.as_ref().map(|(_, digest)| digest.clone());
+    let child_template = signing_key_template(algo, policy_digest)?;
 
     let create_result = context
         .execute_with_session(Some(AuthSession::Password), |ctx| {
@@ -199,7 +240,24 @@ pub(crate) fn cmd_key_create(
         }
     );
     println!("  Parent: SRK (Owner hierarchy)");
-    println!("  Type: persistent, unrestricted signing");
+    match &policy {
+        Some((pcrs_normalized, digest)) => {
+            println!(
+                "  Type: persistent, unrestricted signing, policy-bound (PCR {})",
+                pcrs_normalized
+            );
+            println!("  Policy: PCR(SHA256:{})", pcrs_normalized);
+            println!("  Policy digest: {}", hex::encode(digest.value()));
+            println!(
+                "  NOTE: the policy digest is one-way — the TPM cannot recover this PCR list \
+                 from the key. Pass --policy-pcrs {} to `sign` for every signature.",
+                pcrs_normalized
+            );
+        }
+        None => {
+            println!("  Type: persistent, unrestricted signing");
+        }
+    }
     println!("\nKey persisted [OK]");
     Ok(())
 }
@@ -226,18 +284,27 @@ pub(crate) fn cmd_key_list(context: &mut TpmContext) -> Result<()> {
                         let key_handle = KeyHandle::from(obj_handle);
                         match context.read_public(key_handle) {
                             Ok((public, _, _)) => {
-                                let (algo, attrs) = match &public {
+                                let (algo, attrs, auth_policy_empty) = match &public {
                                     Public::Rsa {
-                                        object_attributes, ..
-                                    } => ("RSA", *object_attributes),
+                                        object_attributes,
+                                        auth_policy,
+                                        ..
+                                    } => {
+                                        ("RSA", *object_attributes, auth_policy.value().is_empty())
+                                    }
                                     Public::Ecc {
-                                        object_attributes, ..
-                                    } => ("ECC", *object_attributes),
+                                        object_attributes,
+                                        auth_policy,
+                                        ..
+                                    } => {
+                                        ("ECC", *object_attributes, auth_policy.value().is_empty())
+                                    }
                                     other => {
                                         println!("  0x{:08X}  {:?}", handle_val, other);
                                         continue;
                                     }
                                 };
+                                let policy_bound = !attrs.user_with_auth() && !auth_policy_empty;
                                 let usage = if attrs.sign_encrypt() && !attrs.decrypt() {
                                     "signing"
                                 } else if !attrs.sign_encrypt() && attrs.decrypt() {
@@ -257,9 +324,10 @@ pub(crate) fn cmd_key_list(context: &mut TpmContext) -> Result<()> {
                                 } else {
                                     ""
                                 };
+                                let policy_note = if policy_bound { "  policy-bound" } else { "" };
                                 println!(
-                                    "  0x{:08X}  {}  {}  {}{}",
-                                    handle_val, algo, restricted, usage, srk_note
+                                    "  0x{:08X}  {}  {}  {}{}{}",
+                                    handle_val, algo, restricted, usage, srk_note, policy_note
                                 );
                             }
                             Err(e) => {

@@ -2,18 +2,18 @@ use anyhow::{Context, Result};
 use log::{debug, info};
 
 use tss_esapi::{
-    constants::CapabilityType,
-    handles::{KeyHandle, ObjectHandle, PersistentTpmHandle, TpmHandle},
+    constants::{CapabilityType, SessionType},
+    handles::{KeyHandle, ObjectHandle, PersistentTpmHandle, SessionHandle, TpmHandle},
     interface_types::{
         algorithm::HashingAlgorithm,
         dynamic_handles::Persistent,
         key_bits::RsaKeyBits,
         resource_handles::{Hierarchy, Provision},
-        session_handles::AuthSession,
+        session_handles::{AuthSession, PolicySession},
     },
     structures::{
-        CapabilityData, PcrSelectionList, PcrSelectionListBuilder, PcrSlot, RsaExponent,
-        SymmetricDefinitionObject,
+        CapabilityData, Digest, PcrSelectionList, PcrSelectionListBuilder, PcrSlot, RsaExponent,
+        SymmetricDefinition, SymmetricDefinitionObject,
     },
     Context as TpmContext,
 };
@@ -101,6 +101,110 @@ impl Drop for KeyGuard<'_> {
             }
         }
     }
+}
+
+/// RAII guard that flushes a TPM auth/policy session handle on drop.
+///
+/// Trial and real policy sessions occupy TPM session slots just like transient
+/// key handles. `tpm-ops test` starts many of them in a single process, which is
+/// a latent exhaustion risk on real hardware (stricter than swtpm) if a session
+/// is never flushed.
+pub(crate) struct SessionGuard<'a> {
+    pub context: &'a mut TpmContext,
+    handle: Option<SessionHandle>,
+}
+
+impl<'a> SessionGuard<'a> {
+    pub fn new(context: &'a mut TpmContext, handle: SessionHandle) -> Self {
+        Self {
+            context,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for SessionGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            if let Err(e) = self.context.flush_context(h.into()) {
+                debug!("SessionGuard: failed to flush session handle: {}", e);
+            }
+        }
+    }
+}
+
+/// Compute the PolicyPCR digest for the current PCR state via a trial session.
+///
+/// This is the create-time half of PolicyPCR: it never authorizes anything, it
+/// just asks the TPM what the policy digest would be if `policy_pcr` were applied
+/// against `pcr_selection` right now. Used both to seal data (`seal.rs`) and to
+/// bind a signing key's auth policy to PCR state at key-creation time.
+pub(crate) fn pcr_policy_digest(
+    context: &mut TpmContext,
+    pcr_selection: PcrSelectionList,
+) -> Result<Digest> {
+    let trial_auth = context
+        .start_auth_session(
+            None,
+            None,
+            None,
+            SessionType::Trial,
+            SymmetricDefinition::AES_256_CFB,
+            HashingAlgorithm::Sha256,
+        )
+        .context("Failed to start trial policy session")?
+        .ok_or_else(|| anyhow::anyhow!("TPM returned no trial policy session handle"))?;
+
+    let guard = SessionGuard::new(context, SessionHandle::from(trial_auth));
+
+    let trial_policy =
+        PolicySession::try_from(trial_auth).context("Failed to create policy session handle")?;
+
+    guard
+        .context
+        .policy_pcr(trial_policy, Digest::default(), pcr_selection)
+        .context("Failed to apply trial PolicyPCR")?;
+
+    guard
+        .context
+        .policy_get_digest(trial_policy)
+        .context("Failed to read trial policy digest")
+}
+
+/// Start a real PolicyPCR session against the current PCR state.
+///
+/// Returns the [`SessionGuard`] (so the session is flushed once the caller is
+/// done with it) together with the [`AuthSession`] to hand to
+/// `execute_with_session` for the gated command (e.g. `sign`, `unseal`). A
+/// policy session is consumed by use — callers must start a fresh one per
+/// TPM operation.
+pub(crate) fn start_pcr_policy_session<'a>(
+    context: &'a mut TpmContext,
+    pcr_selection: PcrSelectionList,
+) -> Result<(SessionGuard<'a>, AuthSession)> {
+    let policy_auth = context
+        .start_auth_session(
+            None,
+            None,
+            None,
+            SessionType::Policy,
+            SymmetricDefinition::AES_256_CFB,
+            HashingAlgorithm::Sha256,
+        )
+        .context("Failed to start policy session")?
+        .ok_or_else(|| anyhow::anyhow!("TPM returned no policy session handle"))?;
+
+    let policy_session =
+        PolicySession::try_from(policy_auth).context("Failed to convert policy session handle")?;
+
+    let guard = SessionGuard::new(context, SessionHandle::from(policy_auth));
+
+    guard
+        .context
+        .policy_pcr(policy_session, Digest::default(), pcr_selection)
+        .context("Failed to apply PolicyPCR")?;
+
+    Ok((guard, policy_auth))
 }
 
 /// Return the persistent SRK handle, creating and persisting it on first call.

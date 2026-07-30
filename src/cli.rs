@@ -34,7 +34,7 @@ pub(crate) enum Commands {
         bytes: usize,
     },
 
-    /// Read PCR values
+    /// Read PCR values, or extend/reset a PCR
     Pcr {
         /// PCR index to read (0-23)
         #[arg(short, long, default_value = "0")]
@@ -43,6 +43,9 @@ pub(crate) enum Commands {
         /// Hash algorithm (sha256 or sha1)
         #[arg(short, long, default_value = "sha256")]
         algo: String,
+
+        #[command(subcommand)]
+        action: Option<PcrAction>,
     },
 
     /// Hash data using TPM
@@ -67,6 +70,13 @@ pub(crate) enum Commands {
         /// Persistent key handle to sign with (e.g. 0x81000001)
         #[arg(short, long)]
         key: Option<String>,
+
+        /// PCR list the signing key's auth policy was bound to at creation
+        /// time (comma-separated, SHA-256 bank), e.g. 0,7. Required for
+        /// policy-bound keys; the TPM — not this client — decides whether
+        /// current PCR state satisfies the policy.
+        #[arg(long)]
+        policy_pcrs: Option<String>,
     },
 
     /// Verify a signature using a persistent TPM key
@@ -157,6 +167,31 @@ pub(crate) enum Commands {
 }
 
 #[derive(Subcommand)]
+pub(crate) enum PcrAction {
+    /// Extend a PCR with the SHA-256 hash of the given data (irreversible until reboot)
+    Extend {
+        /// PCR index to extend (0-23)
+        #[arg(short, long)]
+        index: u8,
+
+        /// Data to hash and extend into the PCR
+        #[arg(short, long)]
+        data: String,
+
+        /// Allow extending a boot-measurement PCR (0-15) outside {16, 23}
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Reset a PCR to its default value (only PCR 16 and 23 from locality 0)
+    Reset {
+        /// PCR index to reset (0-23)
+        #[arg(short, long)]
+        index: u8,
+    },
+}
+
+#[derive(Subcommand)]
 pub(crate) enum KeyCommands {
     /// Create a signing key and persist it in the TPM
     Create {
@@ -167,6 +202,13 @@ pub(crate) enum KeyCommands {
         /// Persistent handle (e.g. 0x81000001)
         #[arg(short, long)]
         persist: String,
+
+        /// Bind the key's auth policy to the current value of these PCRs
+        /// (comma-separated, SHA-256 bank), e.g. 0,7. The TPM will refuse to
+        /// use the key unless the same PCR list is supplied at sign time and
+        /// the PCR state still matches.
+        #[arg(long)]
+        policy_pcrs: Option<String>,
     },
 
     /// List persistent key handles

@@ -3,12 +3,21 @@ use log::{debug, info};
 
 use tss_esapi::{
     constants::PropertyTag,
-    interface_types::resource_handles::Hierarchy,
-    structures::{MaxBuffer, PcrSelectionListBuilder, PcrSlot},
+    handles::PcrHandle,
+    interface_types::{
+        algorithm::HashingAlgorithm, resource_handles::Hierarchy, session_handles::AuthSession,
+    },
+    structures::{Digest, DigestValues, MaxBuffer, PcrSelectionListBuilder, PcrSlot},
     Context as TpmContext,
 };
 
 use crate::tpm::parse_hash_algo;
+
+/// PCRs that are safe to extend/reset from userspace without extra confirmation:
+/// PCR 16 is the debug PCR, PCR 23 is reserved for application use. Both are
+/// resettable from locality 0; boot-measurement PCRs (0-15, e.g. firmware/secure
+/// boot state) are not, and extending them is irreversible until reboot.
+const UNRESTRICTED_PCRS: [u8; 2] = [16, 23];
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_HASH: &str = env!("TPM_OPS_GIT_HASH");
@@ -200,14 +209,182 @@ pub(crate) fn cmd_hash(context: &mut TpmContext, data: &str, algo: &str) -> Resu
     Ok(())
 }
 
+/// Pure gate for `pcr extend`: refuse anything outside {16, 23} unless --force.
+pub(crate) fn check_pcr_extend_allowed(index: u8, force: bool) -> Result<()> {
+    if force || UNRESTRICTED_PCRS.contains(&index) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Refusing to extend PCR {}: only PCR 16 (debug) and PCR 23 (application) are extended \
+         without confirmation. Extending a boot-measurement PCR is irreversible until reboot and \
+         can invalidate anything sealed or attested against its current value. Pass --force to \
+         proceed anyway.",
+        index
+    );
+}
+
+/// Pure gate for `pcr reset`: only {16, 23} are resettable from locality 0, unconditionally.
+pub(crate) fn check_pcr_reset_allowed(index: u8) -> Result<()> {
+    if UNRESTRICTED_PCRS.contains(&index) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Refusing to reset PCR {}: only PCR 16 and PCR 23 are resettable from locality 0. \
+         PCRs 0-15 cannot be reset without a platform-level action (e.g. reboot).",
+        index
+    );
+}
+
+fn pcr_handle_from_index(index: u8) -> Result<PcrHandle> {
+    use PcrHandle::*;
+    Ok(match index {
+        0 => Pcr0,
+        1 => Pcr1,
+        2 => Pcr2,
+        3 => Pcr3,
+        4 => Pcr4,
+        5 => Pcr5,
+        6 => Pcr6,
+        7 => Pcr7,
+        8 => Pcr8,
+        9 => Pcr9,
+        10 => Pcr10,
+        11 => Pcr11,
+        12 => Pcr12,
+        13 => Pcr13,
+        14 => Pcr14,
+        15 => Pcr15,
+        16 => Pcr16,
+        17 => Pcr17,
+        18 => Pcr18,
+        19 => Pcr19,
+        20 => Pcr20,
+        21 => Pcr21,
+        22 => Pcr22,
+        23 => Pcr23,
+        _ => anyhow::bail!("PCR index must be 0-23"),
+    })
+}
+
+/// Extend PCR `index` (SHA-256 bank) with the SHA-256 hash of `data`. Returns the
+/// resulting PCR digest. Does not enforce the safety gate — callers (`cmd_pcr_extend`)
+/// are responsible for calling `check_pcr_extend_allowed` first.
+pub(crate) fn pcr_extend(context: &mut TpmContext, index: u8, data: &[u8]) -> Result<Vec<u8>> {
+    let pcr_handle = pcr_handle_from_index(index)?;
+    let input_digest = hash_bytes(context, data, HashingAlgorithm::Sha256)?;
+    let digest = Digest::try_from(input_digest).context("Failed to build digest for PCR extend")?;
+
+    let mut values = DigestValues::new();
+    values.set(HashingAlgorithm::Sha256, digest);
+
+    info!("Extending PCR {} (SHA-256 bank)...", index);
+    context
+        .execute_with_session(Some(AuthSession::Password), |ctx| {
+            ctx.pcr_extend(pcr_handle, values)
+        })
+        .context("Failed to extend PCR")?;
+
+    let digests = read_pcr_digests(context, index, "sha256")?;
+    digests
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("TPM returned no digest after PCR extend"))
+}
+
+/// Reset PCR `index` to its default value. Returns the PCR digest after reset.
+/// Does not enforce the safety gate — callers (`cmd_pcr_reset`) call
+/// `check_pcr_reset_allowed` first.
+pub(crate) fn pcr_reset(context: &mut TpmContext, index: u8) -> Result<Vec<u8>> {
+    let pcr_handle = pcr_handle_from_index(index)?;
+
+    info!("Resetting PCR {}...", index);
+    context
+        .execute_with_session(Some(AuthSession::Password), |ctx| ctx.pcr_reset(pcr_handle))
+        .context("Failed to reset PCR")?;
+
+    let digests = read_pcr_digests(context, index, "sha256")?;
+    digests
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("TPM returned no digest after PCR reset"))
+}
+
+pub(crate) fn cmd_pcr_extend(
+    context: &mut TpmContext,
+    index: u8,
+    data: &str,
+    force: bool,
+) -> Result<()> {
+    check_pcr_extend_allowed(index, force)?;
+
+    let input_digest = hash_bytes(context, data.as_bytes(), HashingAlgorithm::Sha256)?;
+    let new_digest = pcr_extend(context, index, data.as_bytes())?;
+
+    println!("Extended PCR {} (SHA-256)", index);
+    println!("  Input digest: {}", hex::encode(&input_digest));
+    println!("  New PCR value: {}", hex::encode(&new_digest));
+    println!("\nPCR extend [OK]");
+    Ok(())
+}
+
+pub(crate) fn cmd_pcr_reset(context: &mut TpmContext, index: u8) -> Result<()> {
+    check_pcr_reset_allowed(index)?;
+
+    let new_digest = pcr_reset(context, index)?;
+
+    println!("Reset PCR {}", index);
+    println!("  PCR value: {}", hex::encode(&new_digest));
+    println!("\nPCR reset [OK]");
+    Ok(())
+}
+
 pub(crate) fn hash_bytes(
     context: &mut TpmContext,
     data: &[u8],
-    hash_algo: tss_esapi::interface_types::algorithm::HashingAlgorithm,
+    hash_algo: HashingAlgorithm,
 ) -> Result<Vec<u8>> {
     let buffer = MaxBuffer::try_from(data).context("Data too large for TPM buffer")?;
     let (digest, _ticket) = context
         .hash(buffer, hash_algo, Hierarchy::Null)
         .context("Failed to hash data")?;
     Ok(digest.value().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check_pcr_extend_allowed, check_pcr_reset_allowed};
+
+    #[test]
+    fn extend_allowed_without_force_for_debug_and_application_pcrs() {
+        assert!(check_pcr_extend_allowed(16, false).is_ok());
+        assert!(check_pcr_extend_allowed(23, false).is_ok());
+    }
+
+    #[test]
+    fn extend_refused_without_force_for_boot_measurement_pcrs() {
+        for index in [0, 1, 4, 7, 15] {
+            let err = check_pcr_extend_allowed(index, false).unwrap_err();
+            assert!(err.to_string().contains("Refusing to extend"));
+        }
+    }
+
+    #[test]
+    fn extend_allowed_with_force_for_any_index() {
+        assert!(check_pcr_extend_allowed(0, true).is_ok());
+        assert!(check_pcr_extend_allowed(7, true).is_ok());
+    }
+
+    #[test]
+    fn reset_allowed_for_debug_and_application_pcrs() {
+        assert!(check_pcr_reset_allowed(16).is_ok());
+        assert!(check_pcr_reset_allowed(23).is_ok());
+    }
+
+    #[test]
+    fn reset_refused_unconditionally_for_boot_measurement_pcrs() {
+        for index in [0, 1, 4, 7, 15] {
+            let err = check_pcr_reset_allowed(index).unwrap_err();
+            assert!(err.to_string().contains("Refusing to reset"));
+        }
+    }
 }

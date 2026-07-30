@@ -5,19 +5,21 @@ use log::info;
 
 use tss_esapi::{
     attributes::ObjectAttributesBuilder,
-    constants::SessionType,
     interface_types::{
         algorithm::{HashingAlgorithm, PublicAlgorithm},
-        session_handles::{AuthSession, PolicySession},
+        session_handles::AuthSession,
     },
     structures::{
-        Digest, KeyedHashScheme, PcrSelectionList, Public, PublicBuffer, PublicBuilder,
-        PublicKeyedHashParameters, SensitiveData, SymmetricDefinition,
+        Digest, KeyedHashScheme, Public, PublicBuffer, PublicBuilder, PublicKeyedHashParameters,
+        SensitiveData,
     },
     Context as TpmContext,
 };
 
-use crate::tpm::{create_srk, parse_pcr_indices, pcr_selection_sha256, KeyGuard};
+use crate::tpm::{
+    create_srk, parse_pcr_indices, pcr_policy_digest, pcr_selection_sha256,
+    start_pcr_policy_session, KeyGuard,
+};
 
 const SEALED_BLOB_MAGIC: &str = "TPM_OPS_SEALED_V1";
 
@@ -83,34 +85,6 @@ impl SealedBlob {
     }
 }
 
-fn policy_digest_for_current_pcr(
-    context: &mut TpmContext,
-    pcr_selection: PcrSelectionList,
-) -> Result<Digest> {
-    let trial_auth = context
-        .start_auth_session(
-            None,
-            None,
-            None,
-            SessionType::Trial,
-            SymmetricDefinition::AES_256_CFB,
-            HashingAlgorithm::Sha256,
-        )
-        .context("Failed to start trial policy session")?
-        .ok_or_else(|| anyhow::anyhow!("TPM returned no trial policy session handle"))?;
-
-    let trial_policy =
-        PolicySession::try_from(trial_auth).context("Failed to create policy session handle")?;
-
-    context
-        .policy_pcr(trial_policy, Digest::default(), pcr_selection)
-        .context("Failed to apply trial PolicyPCR")?;
-
-    context
-        .policy_get_digest(trial_policy)
-        .context("Failed to read trial policy digest")
-}
-
 fn sealed_public(policy_digest: Digest) -> Result<Public> {
     let attrs = ObjectAttributesBuilder::new()
         .with_fixed_tpm(true)
@@ -147,7 +121,7 @@ pub(crate) fn cmd_seal(
         .join(",");
 
     let pcr_selection = pcr_selection_sha256(&pcr_indices)?;
-    let policy_digest = policy_digest_for_current_pcr(context, pcr_selection.clone())?;
+    let policy_digest = pcr_policy_digest(context, pcr_selection.clone())?;
 
     let sensitive_data =
         SensitiveData::try_from(data.as_bytes()).context("Data too large to seal for this TPM")?;
@@ -214,7 +188,7 @@ pub(crate) fn unseal_from_file(
     }
 
     let pcr_selection = pcr_selection_sha256(&requested)?;
-    let current_digest = policy_digest_for_current_pcr(context, pcr_selection.clone())?;
+    let current_digest = pcr_policy_digest(context, pcr_selection.clone())?;
     let expected_digest =
         hex::decode(&blob.policy_digest_hex).context("Invalid policy_digest encoding in blob")?;
 
@@ -238,34 +212,13 @@ pub(crate) fn unseal_from_file(
         })
         .context("Failed to load sealed object")?;
     let guard = KeyGuard::new(context, object);
-
-    let policy_auth = guard
-        .context
-        .start_auth_session(
-            None,
-            None,
-            None,
-            SessionType::Policy,
-            SymmetricDefinition::AES_256_CFB,
-            HashingAlgorithm::Sha256,
-        )
-        .context("Failed to start policy session")?
-        .ok_or_else(|| anyhow::anyhow!("TPM returned no policy session handle"))?;
-
-    let policy_session =
-        PolicySession::try_from(policy_auth).context("Failed to convert policy session handle")?;
-
-    guard
-        .context
-        .policy_pcr(policy_session, Digest::default(), pcr_selection)
-        .context("Failed to apply PolicyPCR")?;
-
     let object_handle = guard.handle();
-    let unsealed = guard
+
+    let (policy_guard, policy_session) = start_pcr_policy_session(guard.context, pcr_selection)?;
+
+    let unsealed = policy_guard
         .context
-        .execute_with_session(Some(AuthSession::from(policy_session)), |ctx| {
-            ctx.unseal(object_handle.into())
-        })
+        .execute_with_session(Some(policy_session), |ctx| ctx.unseal(object_handle.into()))
         .context("Unseal failed (policy mismatch or corrupted blob)")?;
 
     Ok(unsealed.value().to_vec())
