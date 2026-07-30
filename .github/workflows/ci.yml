@@ -54,6 +54,54 @@ jobs:
       - name: cargo build
         run: cargo build --release --locked
 
+  cross-build-aarch64:
+    name: Cross-build (aarch64)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Install Rust toolchain
+        # dtolnay/rust-toolchain stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install aarch64 cross toolchain and sysroot packages
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            qemu-user-static \
+            libtss2-dev:arm64 \
+            libc6-dev:arm64 \
+            libssl-dev:arm64
+
+      - name: Cache cargo registry
+        # actions/cache v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-aarch64-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-aarch64-
+
+      - name: Cross-build for aarch64
+        # Compile + link only — this runner cannot execute an aarch64 binary
+        # natively. Reuses the same script a human runs locally so CI and the
+        # documented cross-compile flow can't drift apart. Prints arch,
+        # NEEDED libraries, and the glibc floor the binary requires.
+        run: SYSROOT=/ ./scripts/cross-build-aarch64.sh
+
+      - name: Smoke-test cross-built binary under qemu
+        run: |
+          qemu-aarch64-static -L / target/aarch64-unknown-linux-gnu/release/tpm-ops version
+
   integration-test:
     name: Integration Tests (swtpm)
     if: github.event_name != 'schedule'
