@@ -3,6 +3,7 @@ use log::info;
 
 use tss_esapi::{
     attributes::ObjectAttributesBuilder,
+    constants::Tss2ResponseCodeKind,
     handles::KeyHandle,
     interface_types::{
         algorithm::{HashingAlgorithm, PublicAlgorithm},
@@ -16,30 +17,50 @@ use tss_esapi::{
         PublicBuilder, PublicEccParametersBuilder, PublicKeyRsa, PublicRsaParametersBuilder,
         RsaExponent, RsaScheme, SignatureScheme,
     },
-    Context as TpmContext,
+    Context as TpmContext, Error as TssError,
 };
 
-use crate::tpm::{parse_handle, persistent_to_esys, KeyGuard};
+use crate::tpm::{
+    parse_handle, parse_pcr_indices, pcr_selection_sha256, persistent_to_esys,
+    start_pcr_policy_session, KeyGuard,
+};
 
 pub(crate) fn cmd_sign(
     context: &mut TpmContext,
     data: &str,
     use_ecc: bool,
     key_handle: Option<&str>,
+    policy_pcrs: Option<&str>,
 ) -> Result<()> {
     match key_handle {
-        Some(h) => cmd_sign_persistent(context, data, h),
-        None => cmd_sign_ephemeral(context, data, use_ecc),
+        Some(h) => cmd_sign_persistent(context, data, h, policy_pcrs),
+        None => {
+            if policy_pcrs.is_some() {
+                anyhow::bail!(
+                    "--policy-pcrs requires --key — it only applies to signing with a \
+                     persistent policy-bound key"
+                );
+            }
+            cmd_sign_ephemeral(context, data, use_ecc)
+        }
     }
 }
 
 /// Sign with a persistent key, returning (is_ecc, digest_hex, sig_bytes).
 /// For ECC sig_bytes = R||S (each component zero-padded to 32 bytes).
 /// For RSA sig_bytes = raw PKCS#1 signature.
+///
+/// `policy_pcrs`, if given, must match the PCR list the key was created with
+/// (`key create --policy-pcrs`) — the TPM cannot recover that list from the key
+/// itself (a policy digest is one-way), so the caller must supply it. A fresh
+/// real PolicyPCR session is started and consumed by this single signature; no
+/// client-side check of whether current PCR state matches is performed — the
+/// TPM is the sole arbiter of that.
 pub(crate) fn sign_with_persistent_key(
     context: &mut TpmContext,
     data: &str,
     handle_str: &str,
+    policy_pcrs: Option<&str>,
 ) -> Result<(bool, String, Vec<u8>)> {
     let handle_val = parse_handle(handle_str)?;
     let obj_handle = persistent_to_esys(context, handle_val)?;
@@ -50,6 +71,20 @@ pub(crate) fn sign_with_persistent_key(
         .context("Failed to read public area of persistent key")?;
 
     let is_ecc = matches!(public, Public::Ecc { .. });
+    let is_policy_key = !public.object_attributes().user_with_auth();
+
+    match (is_policy_key, policy_pcrs) {
+        (true, None) => anyhow::bail!(
+            "Key 0x{:08X} is policy-bound (password auth disabled) — pass --policy-pcrs <list> \
+             matching the PCRs it was created with",
+            handle_val
+        ),
+        (false, Some(_)) => anyhow::bail!(
+            "Key 0x{:08X} is not policy-bound (password auth enabled) — --policy-pcrs does not apply",
+            handle_val
+        ),
+        _ => {}
+    }
 
     let data_bytes = data.as_bytes();
     let buffer = MaxBuffer::try_from(data_bytes).context("Data too large")?;
@@ -68,11 +103,36 @@ pub(crate) fn sign_with_persistent_key(
         }
     };
 
-    let signature = context
-        .execute_with_session(Some(AuthSession::Password), |ctx| {
-            ctx.sign(key_handle, digest.clone(), scheme, ticket)
-        })
-        .context("Failed to sign data")?;
+    let signature = match policy_pcrs {
+        None => context
+            .execute_with_session(Some(AuthSession::Password), |ctx| {
+                ctx.sign(key_handle, digest.clone(), scheme, ticket)
+            })
+            .context("Failed to sign data")?,
+        Some(pcrs) => {
+            let indices = parse_pcr_indices(pcrs)?;
+            let pcr_selection = pcr_selection_sha256(&indices)?;
+            let (policy_guard, policy_session) = start_pcr_policy_session(context, pcr_selection)?;
+
+            let sign_result = policy_guard
+                .context
+                .execute_with_session(Some(policy_session), |ctx| {
+                    ctx.sign(key_handle, digest.clone(), scheme, ticket)
+                });
+
+            match sign_result {
+                Ok(sig) => sig,
+                Err(TssError::Tss2Error(code))
+                    if code.kind() == Some(Tss2ResponseCodeKind::PolicyFail) =>
+                {
+                    anyhow::bail!(
+                        "Sign refused by TPM: current PCR state does not satisfy the key's policy"
+                    );
+                }
+                Err(e) => return Err(e).context("Failed to sign data"),
+            }
+        }
+    };
 
     let digest_hex = hex::encode(digest.value());
 
@@ -100,19 +160,29 @@ pub(crate) fn sign_with_persistent_key(
 }
 
 /// Sign with a persistent key and print results. Detects RSA vs ECC from the key's public area.
-fn cmd_sign_persistent(context: &mut TpmContext, data: &str, handle_str: &str) -> Result<()> {
+fn cmd_sign_persistent(
+    context: &mut TpmContext,
+    data: &str,
+    handle_str: &str,
+    policy_pcrs: Option<&str>,
+) -> Result<()> {
     let handle_val = parse_handle(handle_str)?;
 
     info!("Signing with persistent key at 0x{:08X}...", handle_val);
 
-    let (is_ecc, digest_hex, sig_bytes) = sign_with_persistent_key(context, data, handle_str)?;
+    let (is_ecc, digest_hex, sig_bytes) =
+        sign_with_persistent_key(context, data, handle_str, policy_pcrs)?;
 
     println!("\nData: {}", data);
     println!("Digest (SHA256): {}", digest_hex);
     println!(
-        "Key: 0x{:08X} (persistent, {})",
+        "Key: 0x{:08X} (persistent, {}{})",
         handle_val,
-        if is_ecc { "ECC" } else { "RSA" }
+        if is_ecc { "ECC" } else { "RSA" },
+        match policy_pcrs {
+            Some(pcrs) => format!(", policy-bound, PCR {}", pcrs),
+            None => String::new(),
+        }
     );
 
     if is_ecc {
