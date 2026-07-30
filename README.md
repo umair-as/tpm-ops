@@ -15,9 +15,9 @@ Rust CLI for TPM 2.0 operations on the Infineon SLB9672. Targets Raspberry Pi 5 
 | `info` | Manufacturer, firmware version, spec revision |
 | `selftest` | Incremental or full TPM self-test |
 | `random` | Hardware TRNG bytes (1–48) |
-| `pcr` | Read PCR register (SHA-1 / SHA-256 / SHA-384) |
+| `pcr` | Read PCR register (SHA-1 / SHA-256 / SHA-384); `pcr extend` / `pcr reset` a PCR |
 | `hash` | Hash data using the TPM engine |
-| `sign` | Sign with ephemeral RSA-2048 or ECC P-256 key |
+| `sign` | Sign with ephemeral RSA-2048 or ECC P-256 key, or a policy-bound persistent key |
 | `verify` | Verify signature against a persistent key |
 | `key` | Persistent key management — create / list / delete / export-pub |
 | `seal` | Seal a secret to PCR policy, write blob to disk |
@@ -117,6 +117,11 @@ tpm-ops random -b 32
 tpm-ops pcr -i 0
 tpm-ops hash "hello world"
 
+# PCR extend / reset (see "PCR extend safety rule" below)
+tpm-ops pcr extend -i 23 -d "tamper"
+tpm-ops pcr reset -i 23
+tpm-ops pcr extend -i 0 -d "measurement" --force   # refused without --force
+
 # Ephemeral signing
 tpm-ops sign "message"
 tpm-ops sign "message" --ecc
@@ -127,6 +132,15 @@ tpm-ops key list
 tpm-ops sign "message" --key 0x81000001
 tpm-ops verify "message" --key 0x81000001 --sig <hex>
 tpm-ops key delete 0x81000001
+
+# PCR-policy-bound key: signing only works while PCR 23 matches the value
+# captured at key-creation time (see "PCR-policy-bound keys" below).
+tpm-ops key create --algo ecc --persist 0x81000002 --policy-pcrs 23
+tpm-ops sign "message" --key 0x81000002 --policy-pcrs 23
+tpm-ops pcr extend -i 23 -d "tamper"
+tpm-ops sign "message" --key 0x81000002 --policy-pcrs 23   # refused by the TPM
+tpm-ops pcr reset -i 23
+tpm-ops sign "message" --key 0x81000002 --policy-pcrs 23   # succeeds again
 
 # Seal / unseal
 tpm-ops seal "my-secret" --pcrs 0,7 --out sealed.blob
@@ -145,6 +159,47 @@ tpm-ops quote-verify quote.blob \
 # Software TPM (testing)
 tpm-ops --tcti "swtpm:port=2321" test
 ```
+
+### PCR extend safety rule
+
+PCR extends are irreversible until reboot, and PCRs 0-15 cannot be reset at
+all. On the target platform, PCR 0 (firmware) and PCR 7 (secure boot state)
+are the sealing PCRs for production — extending either would corrupt the
+firmware-measurement baseline that sealed secrets and attestation depend on.
+
+- `pcr extend` refuses any index outside `{16, 23}` unless `--force` is
+  passed; the refusal message names the risk.
+- `pcr reset` refuses any index outside `{16, 23}` unconditionally — those
+  are the only PCRs resettable from locality 0 on this platform.
+
+PCR 16 is the debug PCR and PCR 23 is reserved for application use, so both
+commands work on them without confirmation.
+
+### PCR-policy-bound keys
+
+`key create --policy-pcrs <list>` binds a persistent signing key's auth
+policy to the current value of the given PCRs (via a trial `PolicyPCR`
+session, the same machinery `seal`/`unseal` use for data). Password
+authentication is disabled on the key (`user_with_auth = false`); the TPM
+will only perform a signing operation under a real `PolicyPCR` session that
+proves the current PCR state matches.
+
+**The PCR list is not recoverable from the key.** A policy digest is a
+one-way hash — the TPM has no way to report which PCRs a key's policy
+covers, so `sign --key <handle> --policy-pcrs <list>` requires the caller to
+supply the same list used at `key create` time. Getting this list wrong
+looks identical, from the TPM's point of view, to genuine PCR drift: the
+sign is refused either way. Record the PCR list alongside the handle when
+you provision a policy-bound key.
+
+`sign` performs no client-side check of whether current PCR state satisfies
+the policy — the TPM alone decides. A refusal surfaces as:
+
+```
+Error: Sign refused by TPM: current PCR state does not satisfy the key's policy
+```
+
+`key list` marks policy-bound keys with `policy-bound` in its output.
 
 ### Quote trust model
 
@@ -165,9 +220,10 @@ for every quote. This is suitable for local round-trip diagnostics when the
 fingerprint is transferred over an authenticated channel. A production remote
 attestation deployment should provision and pin a stable AK identity.
 
-The hardware test suite reserves persistent handles `0x81000FFD` through
-`0x81000FFF`. It now refuses to run if any of those handles are occupied and
-never deletes a pre-existing key.
+The hardware test suite reserves persistent handles `0x81000FFC` through
+`0x81000FFF` (`0x81000FFC` is used by the policy-bound-key test). It refuses
+to run if any of those handles are occupied and never deletes a pre-existing
+key.
 
 ---
 
