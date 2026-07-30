@@ -3,3 +3,8 @@ build-sdk/
 docs/
 infineon-slb9672-tpm20-spi-fw15xx-ds-rev1-5-2024-11-13-datasheet-en.pdf
 scripts/deploy-tpm-ops-target.sh
+/.build
+# Local run/evidence logs — device-specific, not part of the project
+/logs
+.codex
+/scratch

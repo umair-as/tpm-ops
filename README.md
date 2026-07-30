@@ -54,12 +54,47 @@ sudo apt install libtss2-dev
 cargo build --release
 ```
 
-**Cross-compile for aarch64 (Yocto SDK):**
+---
+
+## Cross-compiling for aarch64
+
+`tpm-ops` links `libtss2` (a C library), so a cross build needs an **aarch64
+sysroot** that provides it (along with glibc, the crt startup objects, and
+libcrypto). Get a sysroot with any of the methods below, then build against it:
 
 ```bash
-source /opt/poky/4.0/environment-setup-cortexa76-poky-linux
-cargo build --target aarch64-unknown-linux-gnu --release
+rustup target add aarch64-unknown-linux-gnu
+sudo apt install gcc-aarch64-linux-gnu        # cross linker
+
+SYSROOT=/path/to/aarch64-sysroot ./scripts/cross-build-aarch64.sh
 ```
+
+The script wires up the cross linker, `--sysroot`, and pkg-config, then reports
+the binary's arch, `NEEDED` libraries, and the highest glibc symbol version it
+requires — so you can confirm it matches your target before deploying.
+
+**Getting a sysroot** — pick one:
+
+1. **arm64 multiarch packages** (simplest, distro-generic):
+   ```bash
+   sudo dpkg --add-architecture arm64
+   sudo apt update
+   sudo apt install libtss2-dev:arm64 libc6-dev:arm64 libssl-dev:arm64
+   SYSROOT=/ ./scripts/cross-build-aarch64.sh
+   ```
+   The resulting binary needs the target's glibc to be at least as new as the
+   sysroot's.
+
+2. **Copy from your target device** (exact ABI match — the binary is linked
+   against the target's own libraries):
+   ```bash
+   ./scripts/pull-device-sysroot.sh user@host   # rsyncs /usr/lib + /usr/include
+   ./scripts/cross-build-aarch64.sh             # uses .build/aarch64-sysroot
+   ```
+
+3. **A Yocto / vendor SDK** — `source` its `environment-setup-*` script (it sets
+   `CC` and `--sysroot`), then
+   `cargo build --target aarch64-unknown-linux-gnu --release`.
 
 ---
 
