@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::{debug, info};
+use log::debug;
 
 use tss_esapi::{
     constants::{CapabilityType, SessionType},
@@ -15,6 +15,7 @@ use tss_esapi::{
         CapabilityData, Digest, PcrSelectionList, PcrSelectionListBuilder, PcrSlot, RsaExponent,
         SymmetricDefinition, SymmetricDefinitionObject,
     },
+    tss2_esys::TPMS_PCR_SELECTION,
     Context as TpmContext,
 };
 
@@ -31,15 +32,36 @@ pub(crate) fn parse_handle(s: &str) -> Result<u32> {
 }
 
 /// Create an ESYS ObjectHandle from a persistent TPM handle value.
+///
+/// Probes existence via `persistent_handle_exists` (GetCapability) first and
+/// fails cleanly if the handle is absent, rather than calling
+/// `tr_from_tpm_public` on a handle the TPM doesn't have — the latter reaches
+/// the tss2 C library's own error path, which logs `WARNING:esys:...` /
+/// `ERROR:esys:...` lines straight to the process's stderr regardless of the
+/// Rust `log` crate's level. Every caller of this function (`sign`, `verify`,
+/// `key export-pub`, `key delete`) gets the clean failure for free.
 pub(crate) fn persistent_to_esys(
     context: &mut TpmContext,
     handle_val: u32,
 ) -> Result<ObjectHandle> {
+    if !persistent_handle_exists(context, handle_val)? {
+        anyhow::bail!("No key found at handle 0x{:08X}", handle_val);
+    }
     let persistent_handle =
         PersistentTpmHandle::new(handle_val).context("Invalid persistent handle range")?;
     context
         .tr_from_tpm_public(TpmHandle::Persistent(persistent_handle))
-        .context("Failed to load persistent handle — key may not exist")
+        .context("Failed to load persistent handle")
+}
+
+/// Validate a single PCR index (0..23). Shared by every command that takes a
+/// bare index — `parse_pcr_indices` (comma lists) uses the identical message
+/// for its per-token check, so `pcr -i 99` and `seal -p 99` fail the same way.
+pub(crate) fn check_pcr_index(index: u8) -> Result<()> {
+    if index > 23 {
+        anyhow::bail!("PCR index out of range: {} (expected 0..23)", index);
+    }
+    Ok(())
 }
 
 /// Check whether a persistent handle exists without issuing a ReadPublic command.
@@ -71,6 +93,44 @@ pub(crate) fn parse_hash_algo(algo: &str) -> Result<HashingAlgorithm> {
         "sha384" => Ok(HashingAlgorithm::Sha384),
         _ => anyhow::bail!("Unsupported hash algorithm: {}", algo),
     }
+}
+
+pub(crate) fn hash_algo_name(algo: HashingAlgorithm) -> &'static str {
+    match algo {
+        HashingAlgorithm::Sha1 => "sha1",
+        HashingAlgorithm::Sha256 => "sha256",
+        HashingAlgorithm::Sha384 => "sha384",
+        HashingAlgorithm::Sha512 => "sha512",
+        HashingAlgorithm::Sm3_256 => "sm3_256",
+        _ => "unknown",
+    }
+}
+
+/// Hash algorithms with at least one PCR bank actually allocated on this TPM.
+///
+/// Used to give a useful error when a PCR read comes back empty: on hardware
+/// where a bank exists in the spec but was never allocated (e.g. SHA-1 on
+/// this reference SLB9672), a `pcr_read` for that bank returns an empty
+/// digest list — indistinguishable, from the response alone, from asking for
+/// an out-of-range index. This lets the caller tell the two apart.
+pub(crate) fn allocated_hash_algorithms(context: &mut TpmContext) -> Result<Vec<HashingAlgorithm>> {
+    let (cap, _more) = context
+        .get_capability(CapabilityType::AssignedPcr, 0, 8)
+        .context("Failed to query allocated PCR banks")?;
+
+    let CapabilityData::AssignedPcr(list) = cap else {
+        return Ok(Vec::new());
+    };
+
+    Ok(list
+        .get_selections()
+        .iter()
+        .filter(|selection| !selection.is_empty())
+        .filter_map(|selection| {
+            let raw: TPMS_PCR_SELECTION = (*selection).into();
+            HashingAlgorithm::try_from(raw.hash).ok()
+        })
+        .collect())
 }
 
 /// RAII guard that flushes a transient TPM key handle on drop.
@@ -223,7 +283,9 @@ pub(crate) fn create_srk(context: &mut TpmContext) -> Result<KeyHandle> {
         return Ok(KeyHandle::from(obj_handle));
     }
 
-    info!("Creating SRK (Storage Root Key) — first-time setup, this takes ~20s...");
+    let spinner = crate::output::Spinner::start(
+        "Creating SRK (Storage Root Key) — first-time setup, this takes ~20s...",
+    );
 
     let srk_public = tss_esapi::utils::create_restricted_decryption_rsa_public(
         SymmetricDefinitionObject::AES_128_CFB,
@@ -254,7 +316,11 @@ pub(crate) fn create_srk(context: &mut TpmContext) -> Result<KeyHandle> {
         .flush_context(transient.into())
         .context("Failed to flush transient SRK after persisting")?;
 
-    info!("SRK persisted at 0x{:08X} [OK]", PERSISTENT_SRK_HANDLE);
+    drop(spinner);
+    crate::output::status(&format!(
+        "SRK persisted at 0x{:08X} [OK]",
+        PERSISTENT_SRK_HANDLE
+    ));
 
     let obj_handle = persistent_to_esys(context, PERSISTENT_SRK_HANDLE)
         .context("Failed to load newly persisted SRK")?;
@@ -272,9 +338,7 @@ pub(crate) fn parse_pcr_indices(pcrs: &str) -> Result<Vec<u8>> {
         let idx: u8 = token
             .parse()
             .with_context(|| format!("Invalid PCR index '{}'", token))?;
-        if idx > 23 {
-            anyhow::bail!("PCR index out of range: {} (expected 0..23)", idx);
-        }
+        check_pcr_index(idx)?;
         if !out.contains(&idx) {
             out.push(idx);
         }

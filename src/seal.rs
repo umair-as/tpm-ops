@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::{Context, Result};
-use log::info;
+use log::debug;
 
 use tss_esapi::{
     attributes::ObjectAttributesBuilder,
@@ -16,6 +16,7 @@ use tss_esapi::{
     Context as TpmContext,
 };
 
+use crate::output::{print_json, Json};
 use crate::tpm::{
     create_srk, parse_pcr_indices, pcr_policy_digest, pcr_selection_sha256,
     start_pcr_policy_session, KeyGuard,
@@ -112,6 +113,7 @@ pub(crate) fn cmd_seal(
     data: &str,
     pcrs: &str,
     out_path: &str,
+    json: bool,
 ) -> Result<()> {
     let pcr_indices = parse_pcr_indices(pcrs)?;
     let pcrs_normalized = pcr_indices
@@ -128,7 +130,7 @@ pub(crate) fn cmd_seal(
 
     let public = sealed_public(policy_digest.clone())?;
 
-    info!(
+    debug!(
         "Sealing {} bytes with PolicyPCR(SHA256:{})...",
         data.len(),
         pcrs_normalized
@@ -153,6 +155,22 @@ pub(crate) fn cmd_seal(
 
     fs::write(Path::new(out_path), blob.serialize())
         .with_context(|| format!("Failed to write sealed blob to {}", out_path))?;
+
+    if json {
+        print_json(
+            "tpm-ops.seal.v1",
+            vec![
+                ("path", Json::Str(out_path.to_string())),
+                ("bytes", Json::UInt(data.len() as u64)),
+                ("pcrs", Json::Str(pcrs_normalized)),
+                (
+                    "policy_digest",
+                    Json::Str(hex::encode(policy_digest.value())),
+                ),
+            ],
+        );
+        return Ok(());
+    }
 
     println!("Sealed data written to {}", out_path);
     println!("  Bytes: {}", data.len());
@@ -224,15 +242,33 @@ pub(crate) fn unseal_from_file(
     Ok(unsealed.value().to_vec())
 }
 
-pub(crate) fn cmd_unseal(context: &mut TpmContext, in_path: &str, pcrs: &str) -> Result<()> {
+pub(crate) fn cmd_unseal(
+    context: &mut TpmContext,
+    in_path: &str,
+    pcrs: &str,
+    json: bool,
+) -> Result<()> {
     let secret = unseal_from_file(context, in_path, pcrs)?;
+    let utf8 = std::str::from_utf8(&secret).ok();
+
+    if json {
+        print_json(
+            "tpm-ops.unseal.v1",
+            vec![
+                ("bytes", Json::UInt(secret.len() as u64)),
+                ("data_hex", Json::Str(hex::encode(&secret))),
+                ("data_utf8", Json::Str(utf8.unwrap_or_default().to_string())),
+            ],
+        );
+        return Ok(());
+    }
 
     println!("Unsealed {} bytes", secret.len());
     println!("Data (hex): {}", hex::encode(&secret));
 
-    match std::str::from_utf8(&secret) {
-        Ok(text) => println!("Data (utf8): {}", text),
-        Err(_) => println!("Data (utf8): <non-UTF8>"),
+    match utf8 {
+        Some(text) => println!("Data (utf8): {}", text),
+        None => println!("Data (utf8): <non-UTF8>"),
     }
 
     println!("\nUnseal operation [OK]");

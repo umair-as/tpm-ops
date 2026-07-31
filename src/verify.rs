@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::info;
+use log::debug;
 
 use tss_esapi::{
     handles::KeyHandle,
@@ -10,6 +10,7 @@ use tss_esapi::{
     Context as TpmContext,
 };
 
+use crate::output::{print_json, Json};
 use crate::tpm::{parse_handle, persistent_to_esys};
 
 /// Verify a signature produced by `tpm-ops sign --key`.
@@ -22,6 +23,7 @@ pub(crate) fn cmd_verify(
     data: &str,
     handle_str: &str,
     sig_hex: &str,
+    json: bool,
 ) -> Result<()> {
     let handle_val = parse_handle(handle_str)?;
     let obj_handle = persistent_to_esys(context, handle_val)?;
@@ -61,13 +63,32 @@ pub(crate) fn cmd_verify(
         Signature::RsaSsa(sig_rsa)
     };
 
-    info!(
+    debug!(
         "Verifying {} signature against key 0x{:08X}...",
         if is_ecc { "ECC" } else { "RSA" },
         handle_val
     );
 
-    match context.verify_signature(key_handle, digest, signature) {
+    let result = context.verify_signature(key_handle, digest, signature);
+
+    if json {
+        print_json(
+            "tpm-ops.verify.v1",
+            vec![
+                ("valid", Json::Bool(result.is_ok())),
+                ("key", Json::Str(format!("0x{:08x}", handle_val))),
+                (
+                    "algorithm",
+                    Json::Str(if is_ecc { "ecdsa" } else { "rsa-ssa" }.to_string()),
+                ),
+            ],
+        );
+        return result
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("Verification failed: {}", e));
+    }
+
+    match result {
         Ok(_) => {
             println!("Data: {}", data);
             println!(

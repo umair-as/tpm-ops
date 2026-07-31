@@ -16,15 +16,15 @@ pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
     println!("=== TPM Test Suite ===\n");
 
     println!("--- Test 1: TPM Self-Test ---");
-    cmd_selftest(context, false)?;
+    cmd_selftest(context, false, false)?;
     println!();
 
     println!("--- Test 2: TPM Info ---");
-    cmd_info(context)?;
+    cmd_info(context, false)?;
     println!();
 
     println!("--- Test 3: Random Number Generation ---");
-    cmd_random(context, 32)?;
+    cmd_random(context, 32, false)?;
     let random = random_bytes(context, 32)?;
     if random.len() != 32 || random.iter().all(|&byte| byte == 0) {
         anyhow::bail!("TPM random output failed length/non-zero validation");
@@ -33,7 +33,7 @@ pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
     println!();
 
     println!("--- Test 4: PCR Read ---");
-    cmd_pcr(context, 0, "sha256")?;
+    cmd_pcr(context, 0, "sha256", false)?;
     let pcr_digests = read_pcr_digests(context, 0, "sha256")?;
     if pcr_digests.len() != 1 || pcr_digests[0].len() != 32 {
         anyhow::bail!("PCR read returned an unexpected SHA-256 digest shape");
@@ -42,7 +42,7 @@ pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
     println!();
 
     println!("--- Test 5: TPM Hash ---");
-    cmd_hash(context, "Hello, TPM!", "sha256")?;
+    cmd_hash(context, Some("Hello, TPM!"), None, "sha256", false)?;
     let digest = hash_bytes(context, b"Hello, TPM!", HashingAlgorithm::Sha256)?;
     let expected = hex::decode("4c48a67be006062fd11a2f0333d3c6daf5a924cbc3ffc04a1c64625011e51e89")?;
     if digest != expected {
@@ -52,11 +52,27 @@ pub(crate) fn cmd_test(context: &mut TpmContext) -> Result<()> {
     println!();
 
     println!("--- Test 6: RSA Signing (ephemeral) ---");
-    cmd_sign(context, "Test message for RSA signing", false, None, None)?;
+    cmd_sign(
+        context,
+        Some("Test message for RSA signing"),
+        None,
+        false,
+        None,
+        None,
+        false,
+    )?;
     println!();
 
     println!("--- Test 7: ECC Signing (ephemeral) ---");
-    cmd_sign(context, "Test message for ECC signing", true, None, None)?;
+    cmd_sign(
+        context,
+        Some("Test message for ECC signing"),
+        None,
+        true,
+        None,
+        None,
+        false,
+    )?;
     println!();
 
     println!("--- Test 8: Persistent Key Lifecycle ---");
@@ -97,21 +113,23 @@ fn cmd_test_persistent_key(context: &mut TpmContext) -> Result<()> {
     }
 
     println!("  Creating test RSA key...");
-    cmd_key_create(context, "rsa", test_handle, None)?;
+    cmd_key_create(context, "rsa", test_handle, None, false)?;
 
     let test_result = {
         println!("  Signing with persistent key...");
         cmd_sign(
             context,
-            "persistent-key-test",
+            Some("persistent-key-test"),
+            None,
             false,
             Some(test_handle),
             None,
+            false,
         )
     };
 
     println!("  Deleting test key...");
-    let cleanup_result = cmd_key_delete(context, test_handle);
+    let cleanup_result = cmd_key_delete(context, test_handle, true, false);
     combine_test_and_cleanup(test_result, cleanup_result, test_handle)?;
 
     println!("\nPersistent key lifecycle [OK]");
@@ -134,7 +152,7 @@ fn cmd_test_sign_verify(context: &mut TpmContext) -> Result<()> {
         }
 
         println!("  Creating test {} key...", algo.to_uppercase());
-        cmd_key_create(context, algo, handle_str, None)?;
+        cmd_key_create(context, algo, handle_str, None, false)?;
 
         let test_result = (|| {
             println!("  Signing...");
@@ -142,10 +160,10 @@ fn cmd_test_sign_verify(context: &mut TpmContext) -> Result<()> {
             let sig_hex = hex::encode(&sig_bytes);
 
             println!("  Verifying...");
-            cmd_verify(context, test_data, handle_str, &sig_hex)?;
+            cmd_verify(context, test_data, handle_str, &sig_hex, false)?;
 
             println!("  Verifying tampered message (should fail)...");
-            let error = match cmd_verify(context, "tampered-message", handle_str, &sig_hex) {
+            let error = match cmd_verify(context, "tampered-message", handle_str, &sig_hex, false) {
                 Ok(()) => anyhow::bail!("Tampered message was incorrectly accepted"),
                 Err(error) => error,
             };
@@ -160,7 +178,7 @@ fn cmd_test_sign_verify(context: &mut TpmContext) -> Result<()> {
         })();
 
         println!("  Deleting test key...");
-        let cleanup_result = cmd_key_delete(context, handle_str);
+        let cleanup_result = cmd_key_delete(context, handle_str, true, false);
         combine_test_and_cleanup(test_result, cleanup_result, handle_str)?;
 
         println!("  {} sign+verify [OK]", algo.to_uppercase());
@@ -177,7 +195,7 @@ fn cmd_test_seal_unseal(context: &mut TpmContext) -> Result<()> {
 
     let test_result = (|| {
         println!("  Sealing test payload...");
-        cmd_seal(context, payload, "0", &path)?;
+        cmd_seal(context, payload, "0", &path, false)?;
 
         println!("  Unsealing with matching PCR policy...");
         let unsealed = unseal_from_file(context, &path, "0")?;
@@ -214,7 +232,7 @@ fn cmd_test_seal_unseal(context: &mut TpmContext) -> Result<()> {
         pcr_reset(context, 23)?;
 
         println!("  Sealing test payload to PCR 23...");
-        cmd_seal(context, payload23, "23", &path23)?;
+        cmd_seal(context, payload23, "23", &path23, false)?;
 
         println!("  Extending PCR 23 (real state change)...");
         pcr_extend(context, 23, b"tamper-seal")?;
@@ -249,15 +267,16 @@ fn cmd_test_quote(context: &mut TpmContext) -> Result<()> {
 
     let test_result = (|| {
         println!("  Generating RSA quote over PCR 0...");
-        cmd_quote(context, "0", Some(nonce), "rsa", Some(&path))?;
+        cmd_quote(context, "0", Some(nonce), "rsa", Some(&path), false)?;
         let ak_fingerprint = quote_public_fingerprint_from_file(context, &path)?;
 
         println!("  Verifying quote with trusted expectations...");
-        cmd_quote_verify(context, &path, nonce, &ak_fingerprint, "0")?;
+        cmd_quote_verify(context, &path, nonce, &ak_fingerprint, "0", false)?;
 
         println!("  Verifying a mismatched challenge is rejected...");
         let wrong_nonce = "0000000000000000000000000000000000000000000000000000000000000000";
-        let error = match cmd_quote_verify(context, &path, wrong_nonce, &ak_fingerprint, "0") {
+        let error = match cmd_quote_verify(context, &path, wrong_nonce, &ak_fingerprint, "0", false)
+        {
             Ok(()) => anyhow::bail!("Mismatched quote nonce was incorrectly accepted"),
             Err(error) => error,
         };
@@ -275,7 +294,8 @@ fn cmd_test_quote(context: &mut TpmContext) -> Result<()> {
         println!("  Verifying an untrusted AK is rejected...");
         let untrusted_fingerprint =
             "0000000000000000000000000000000000000000000000000000000000000000";
-        let error = match cmd_quote_verify(context, &path, nonce, untrusted_fingerprint, "0") {
+        let error = match cmd_quote_verify(context, &path, nonce, untrusted_fingerprint, "0", false)
+        {
             Ok(()) => anyhow::bail!("Untrusted AK was incorrectly accepted"),
             Err(error) => error,
         };
@@ -291,7 +311,7 @@ fn cmd_test_quote(context: &mut TpmContext) -> Result<()> {
         println!("  Untrusted AK correctly rejected [OK]");
 
         println!("  Verifying an unexpected PCR selection is rejected...");
-        let error = match cmd_quote_verify(context, &path, nonce, &ak_fingerprint, "1") {
+        let error = match cmd_quote_verify(context, &path, nonce, &ak_fingerprint, "1", false) {
             Ok(()) => anyhow::bail!("Unexpected PCR selection was incorrectly accepted"),
             Err(error) => error,
         };
@@ -338,7 +358,7 @@ fn cmd_test_policy_bound_key(context: &mut TpmContext) -> Result<()> {
         println!("  PCR 23 baseline: {}", hex::encode(&baseline));
 
         println!("  Creating policy-bound ECC key (PCR 23)...");
-        cmd_key_create(context, "ecc", test_handle, Some("23"))?;
+        cmd_key_create(context, "ecc", test_handle, Some("23"), false)?;
 
         println!("  Signing with matching PCR policy (should succeed)...");
         let (_, _, sig_bytes) =
@@ -346,7 +366,7 @@ fn cmd_test_policy_bound_key(context: &mut TpmContext) -> Result<()> {
         let sig_hex = hex::encode(&sig_bytes);
 
         println!("  Verifying signature round-trips...");
-        cmd_verify(context, test_data, test_handle, &sig_hex)?;
+        cmd_verify(context, test_data, test_handle, &sig_hex, false)?;
 
         println!("  Signing 5 more times in this process (session-leak check)...");
         for attempt in 1..=5 {
@@ -389,8 +409,8 @@ fn cmd_test_policy_bound_key(context: &mut TpmContext) -> Result<()> {
     })();
 
     println!("  Deleting test key...");
-    let cleanup_result =
-        cmd_key_delete(context, test_handle).and_then(|()| pcr_reset(context, 23).map(|_| ()));
+    let cleanup_result = cmd_key_delete(context, test_handle, true, false)
+        .and_then(|()| pcr_reset(context, 23).map(|_| ()));
     combine_test_and_cleanup(test_result, cleanup_result, test_handle)?;
 
     println!("\nPolicy-bound key [OK]");

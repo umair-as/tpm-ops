@@ -9,6 +9,7 @@ license = "MIT"
 tss-esapi = "7"
 tss-esapi-sys = "0.5"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 anyhow = "1"
 hex = "0.4"
 log = "0.4"
