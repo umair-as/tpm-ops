@@ -69,6 +69,16 @@ pub(crate) fn check_pcr_index(index: u8) -> Result<()> {
 /// Uses GetCapability(Handles) instead of tr_from_tpm_public so that probing
 /// an absent handle does not trigger tss2 C-library error logs.
 pub(crate) fn persistent_handle_exists(context: &mut TpmContext, handle_val: u32) -> Result<bool> {
+    // Persistent handles are defined by the TPM 2.0 spec to have MSO (top byte)
+    // 0x81 (TPM_HT_PERSISTENT); anything else can't exist as one. Reject before
+    // ever calling GetCapability: passing a wrongly-typed handle as its `property`
+    // argument is itself a TPM-level error, and — unlike an absent-but-correctly-typed
+    // handle — that genuinely reaches the TPM and triggers the same tss2 C-library
+    // stderr spam this function exists to avoid (confirmed with e.g. 0x99999999).
+    if handle_val >> 24 != 0x81 {
+        return Ok(false);
+    }
+
     // GetCapability returns handles >= property, up to count. Ask for 1 starting
     // at our exact handle — if it exists it will be the first (and only) result.
     let (cap, _more) = context

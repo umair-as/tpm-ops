@@ -83,9 +83,13 @@ pub(crate) fn cmd_verify(
                 ),
             ],
         );
-        return result
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("Verification failed: {}", e));
+        // Exactly one JSON object per invocation is the whole point of --json: an
+        // invalid signature is carried by the exit code, not a second object from
+        // main's error handler (which `Err` would trigger on top of the one above).
+        if result.is_err() {
+            std::process::exit(1);
+        }
+        return Ok(());
     }
 
     match result {

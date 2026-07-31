@@ -76,7 +76,7 @@ pub(crate) enum Commands {
 
     /// Read PCR values, or extend/reset a PCR
     #[command(
-        after_help = "Examples:\n  tpm-ops pcr -i 0\n  tpm-ops pcr -i 23 extend -d \"event\" \n  tpm-ops pcr -i 23 reset"
+        after_help = "Examples:\n  tpm-ops pcr -i 0\n  tpm-ops pcr extend -i 23 -d \"event\"\n  tpm-ops pcr reset -i 23"
     )]
     Pcr {
         /// PCR index to read (0-23)
@@ -330,7 +330,7 @@ pub(crate) enum KeyCommands {
         handle: Option<String>,
 
         /// Persistent handle to remove (alternative to the positional form)
-        #[arg(short = 'k', long, conflicts_with = "handle")]
+        #[arg(short = 'k', long = "handle", conflicts_with = "handle")]
         handle_flag: Option<String>,
     },
 
@@ -341,7 +341,7 @@ pub(crate) enum KeyCommands {
         handle: Option<String>,
 
         /// Persistent handle (alternative to the positional form)
-        #[arg(short = 'k', long, conflicts_with = "handle")]
+        #[arg(short = 'k', long = "handle", conflicts_with = "handle")]
         handle_flag: Option<String>,
     },
 }
