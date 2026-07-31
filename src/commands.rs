@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::{debug, info};
+use log::debug;
 
 use tss_esapi::{
     constants::PropertyTag,
@@ -11,7 +11,8 @@ use tss_esapi::{
     Context as TpmContext,
 };
 
-use crate::tpm::parse_hash_algo;
+use crate::output::{print_json, Json};
+use crate::tpm::{allocated_hash_algorithms, check_pcr_index, hash_algo_name, parse_hash_algo};
 
 /// PCRs that are safe to extend/reset from userspace without extra confirmation:
 /// PCR 16 is the debug PCR, PCR 23 is reserved for application use. Both are
@@ -22,7 +23,17 @@ const UNRESTRICTED_PCRS: [u8; 2] = [16, 23];
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const GIT_HASH: &str = env!("TPM_OPS_GIT_HASH");
 
-pub(crate) fn cmd_version() -> Result<()> {
+pub(crate) fn cmd_version(json: bool) -> Result<()> {
+    if json {
+        print_json(
+            "tpm-ops.version.v1",
+            vec![
+                ("version", Json::Str(VERSION.to_string())),
+                ("git_hash", Json::Str(GIT_HASH.to_string())),
+            ],
+        );
+        return Ok(());
+    }
     println!("tpm-ops {}", VERSION);
     println!("git: {}", GIT_HASH);
     Ok(())
@@ -34,8 +45,8 @@ fn get_property(context: &mut TpmContext, tag: PropertyTag) -> Result<Option<u32
         .context("Failed to read TPM property")
 }
 
-pub(crate) fn cmd_info(context: &mut TpmContext) -> Result<()> {
-    info!("=== TPM Information ===");
+pub(crate) fn cmd_info(context: &mut TpmContext, json: bool) -> Result<()> {
+    debug!("=== TPM Information ===");
 
     let manufacturer = get_property(context, PropertyTag::Manufacturer)?.ok_or_else(|| {
         anyhow::anyhow!("TPM did not report manufacturer — device may be unresponsive")
@@ -47,8 +58,6 @@ pub(crate) fn cmd_info(context: &mut TpmContext) -> Result<()> {
         .filter(|&&b| b != 0)
         .map(|&b| b as char)
         .collect();
-
-    println!("Manufacturer: {} (0x{:08X})", mfr_str, manufacturer);
 
     let vendor_vals = [
         PropertyTag::VendorString1,
@@ -65,15 +74,46 @@ pub(crate) fn cmd_info(context: &mut TpmContext) -> Result<()> {
         .map(|b| b as char)
         .collect::<String>();
 
+    let firmware = get_property(context, PropertyTag::FirmwareVersion1)?;
+    let revision = get_property(context, PropertyTag::Revision)?;
+
+    if json {
+        print_json(
+            "tpm-ops.info.v1",
+            vec![
+                ("manufacturer", Json::Str(mfr_str)),
+                (
+                    "manufacturer_hex",
+                    Json::Str(format!("0x{:08x}", manufacturer)),
+                ),
+                ("vendor", Json::Str(vendor_str)),
+                (
+                    "firmware",
+                    match firmware {
+                        Some(fw1) => Json::Str(format!("{}.{}", fw1 >> 16, fw1 & 0xFFFF)),
+                        None => Json::Str(String::new()),
+                    },
+                ),
+                (
+                    "spec_revision",
+                    match revision {
+                        Some(rev) => Json::Str(format!("{}.{}", rev / 100, rev % 100)),
+                        None => Json::Str(String::new()),
+                    },
+                ),
+            ],
+        );
+        return Ok(());
+    }
+
+    println!("Manufacturer: {} (0x{:08X})", mfr_str, manufacturer);
     if !vendor_str.is_empty() {
         println!("Vendor: {}", vendor_str);
     }
-
-    if let Some(fw1) = get_property(context, PropertyTag::FirmwareVersion1)? {
+    if let Some(fw1) = firmware {
         println!("Firmware: {}.{}", fw1 >> 16, fw1 & 0xFFFF);
     }
-
-    if let Some(rev) = get_property(context, PropertyTag::Revision)? {
+    if let Some(rev) = revision {
         println!("Spec Revision: {}.{}", rev / 100, rev % 100);
     }
 
@@ -81,39 +121,63 @@ pub(crate) fn cmd_info(context: &mut TpmContext) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_selftest(context: &mut TpmContext, full: bool) -> Result<()> {
-    info!("Running TPM self-test (full={})...", full);
+pub(crate) fn cmd_selftest(context: &mut TpmContext, full: bool, json: bool) -> Result<()> {
+    debug!("Running TPM self-test (full={})...", full);
 
     context.self_test(full).context("TPM self-test failed")?;
 
-    println!("TPM self-test: PASSED");
-    println!("  Mode: {}", if full { "full" } else { "incremental" });
-
-    match context.get_test_result() {
-        Ok((data, result)) => {
-            if result.is_ok() {
-                println!("  Result: OK");
-            } else {
-                println!("  Result: {:?}", result);
-            }
-            if !data.is_empty() {
-                println!("  Test data: {} bytes", data.len());
-            }
-        }
+    let (result_ok, test_data_len) = match context.get_test_result() {
+        Ok((data, result)) => (Some(result.is_ok()), data.len()),
         Err(e) => {
             debug!("Could not read test result details: {}", e);
+            (None, 0)
         }
+    };
+
+    if json {
+        print_json(
+            "tpm-ops.selftest.v1",
+            vec![
+                ("passed", Json::Bool(true)),
+                ("full", Json::Bool(full)),
+                ("result_ok", Json::Bool(result_ok.unwrap_or(true))),
+                ("test_data_bytes", Json::UInt(test_data_len as u64)),
+            ],
+        );
+        return Ok(());
+    }
+
+    println!("TPM self-test: PASSED");
+    println!("  Mode: {}", if full { "full" } else { "incremental" });
+    match result_ok {
+        Some(true) => println!("  Result: OK"),
+        Some(false) => println!("  Result: not OK"),
+        None => {}
+    }
+    if test_data_len > 0 {
+        println!("  Test data: {} bytes", test_data_len);
     }
 
     println!("\nTPM health check [OK]");
     Ok(())
 }
 
-pub(crate) fn cmd_random(context: &mut TpmContext, num_bytes: usize) -> Result<()> {
-    let random_bytes = random_bytes(context, num_bytes)?;
+pub(crate) fn cmd_random(context: &mut TpmContext, num_bytes: usize, json: bool) -> Result<()> {
+    let bytes = random_bytes(context, num_bytes)?;
 
-    println!("Random bytes ({} bytes):", random_bytes.len());
-    println!("{}", hex::encode(random_bytes));
+    if json {
+        print_json(
+            "tpm-ops.random.v1",
+            vec![
+                ("bytes", Json::UInt(bytes.len() as u64)),
+                ("data", Json::Str(hex::encode(&bytes))),
+            ],
+        );
+        return Ok(());
+    }
+
+    println!("Random bytes ({} bytes):", bytes.len());
+    println!("{}", hex::encode(bytes));
 
     Ok(())
 }
@@ -123,7 +187,7 @@ pub(crate) fn random_bytes(context: &mut TpmContext, num_bytes: usize) -> Result
         anyhow::bail!("Byte count must be between 1 and 48");
     }
 
-    info!("Generating {} random bytes from TPM TRNG...", num_bytes);
+    debug!("Generating {} random bytes from TPM TRNG...", num_bytes);
 
     let mut output = Vec::with_capacity(num_bytes);
     while output.len() < num_bytes {
@@ -139,8 +203,24 @@ pub(crate) fn random_bytes(context: &mut TpmContext, num_bytes: usize) -> Result
     Ok(output)
 }
 
-pub(crate) fn cmd_pcr(context: &mut TpmContext, index: u8, algo: &str) -> Result<()> {
+pub(crate) fn cmd_pcr(context: &mut TpmContext, index: u8, algo: &str, json: bool) -> Result<()> {
     let digests = read_pcr_digests(context, index, algo)?;
+
+    if json {
+        print_json(
+            "tpm-ops.pcr.v1",
+            vec![
+                ("index", Json::UInt(index as u64)),
+                ("algo", Json::Str(algo.to_lowercase())),
+                (
+                    "digests",
+                    Json::Array(digests.iter().map(|d| Json::Str(hex::encode(d))).collect()),
+                ),
+            ],
+        );
+        return Ok(());
+    }
+
     for digest in digests {
         println!("PCR[{}] ({}):", index, algo.to_uppercase());
         println!("{}", hex::encode(digest));
@@ -153,9 +233,7 @@ pub(crate) fn read_pcr_digests(
     index: u8,
     algo: &str,
 ) -> Result<Vec<Vec<u8>>> {
-    if index > 23 {
-        anyhow::bail!("PCR index must be 0-23");
-    }
+    check_pcr_index(index)?;
 
     let hash_algo = parse_hash_algo(algo)?;
     let pcr_mask = 1u32
@@ -168,7 +246,7 @@ pub(crate) fn read_pcr_digests(
         .build()
         .context("Failed to build PCR selection")?;
 
-    info!("Reading PCR {} with {}...", index, algo.to_uppercase());
+    debug!("Reading PCR {} with {}...", index, algo.to_uppercase());
 
     let (_, _, digest_list) = context
         .pcr_read(pcr_selection)
@@ -176,6 +254,21 @@ pub(crate) fn read_pcr_digests(
 
     let digests = digest_list.value();
     if digests.is_empty() {
+        let allocated = allocated_hash_algorithms(context).unwrap_or_default();
+        if !allocated.contains(&hash_algo) {
+            let available: Vec<&str> = allocated.iter().copied().map(hash_algo_name).collect();
+            anyhow::bail!(
+                "The {} bank is not allocated on this TPM (nothing is wrong with PCR {}) — \
+                 available bank(s): {}",
+                algo.to_uppercase(),
+                index,
+                if available.is_empty() {
+                    "none reported".to_string()
+                } else {
+                    available.join(", ")
+                }
+            );
+        }
         anyhow::bail!("TPM returned no digest for PCR {}", index);
     }
 
@@ -185,23 +278,87 @@ pub(crate) fn read_pcr_digests(
         .collect())
 }
 
-pub(crate) fn cmd_hash(context: &mut TpmContext, data: &str, algo: &str) -> Result<()> {
-    let hash_algo = parse_hash_algo(algo)?;
+/// Read all of stdin as raw bytes — shared by `hash`/`sign`/`verify`'s
+/// "-" and `--file -` stdin support.
+pub(crate) fn read_stdin_bytes() -> Result<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .read_to_end(&mut buf)
+        .context("Failed to read stdin")?;
+    Ok(buf)
+}
 
-    let data_bytes = if data.chars().all(|c| c.is_ascii_hexdigit()) && data.len().is_multiple_of(2)
-    {
+fn hex_or_text_bytes(data: &str) -> Vec<u8> {
+    if data.chars().all(|c| c.is_ascii_hexdigit()) && data.len().is_multiple_of(2) {
         hex::decode(data).unwrap_or_else(|_| data.as_bytes().to_vec())
     } else {
         data.as_bytes().to_vec()
-    };
+    }
+}
 
-    info!(
+/// Resolve `sign`'s input: a positional argument, `--file <path>`, or "-"
+/// (either form) for stdin. Unlike `hash`, this must decode as UTF-8 text —
+/// `sign`'s data has always been a string (it's hashed via `.as_bytes()` and
+/// echoed back in the human printer), so file/stdin input keeps that contract
+/// rather than accepting arbitrary binary content.
+pub(crate) fn resolve_text_arg(data: Option<&str>, file: Option<&str>) -> Result<String> {
+    let bytes = match (data, file) {
+        (Some("-"), None) | (None, Some("-")) => read_stdin_bytes()?,
+        (Some(d), None) => return Ok(d.to_string()),
+        (None, Some(f)) => std::fs::read(f).with_context(|| format!("Failed to read {}", f))?,
+        (None, None) => {
+            anyhow::bail!("Provide data as an argument, --file <path>, or \"-\" for stdin")
+        }
+        (Some(_), Some(_)) => unreachable!("clap enforces --file conflicts_with data"),
+    };
+    String::from_utf8(bytes).context("Input is not valid UTF-8 text")
+}
+
+/// Resolve `hash`'s input: a positional argument (hex-or-text auto-detected,
+/// same as always), `--file <path>`, or "-" (either form) for stdin. File/stdin
+/// content is hashed as raw bytes — no hex auto-detection, since that only
+/// makes sense for a short command-line argument.
+pub(crate) fn resolve_hash_bytes(data: Option<&str>, file: Option<&str>) -> Result<Vec<u8>> {
+    match (data, file) {
+        (Some("-"), None) | (None, Some("-")) => read_stdin_bytes(),
+        (Some(d), None) => Ok(hex_or_text_bytes(d)),
+        (None, Some(f)) => std::fs::read(f).with_context(|| format!("Failed to read {}", f)),
+        (None, None) => {
+            anyhow::bail!("Provide data as an argument, --file <path>, or \"-\" for stdin")
+        }
+        (Some(_), Some(_)) => unreachable!("clap enforces --file conflicts_with data"),
+    }
+}
+
+pub(crate) fn cmd_hash(
+    context: &mut TpmContext,
+    data: Option<&str>,
+    file: Option<&str>,
+    algo: &str,
+    json: bool,
+) -> Result<()> {
+    let hash_algo = parse_hash_algo(algo)?;
+    let data_bytes = resolve_hash_bytes(data, file)?;
+
+    debug!(
         "Hashing {} bytes with {}...",
         data_bytes.len(),
         algo.to_uppercase()
     );
 
     let digest = hash_bytes(context, &data_bytes, hash_algo)?;
+
+    if json {
+        print_json(
+            "tpm-ops.hash.v1",
+            vec![
+                ("algo", Json::Str(algo.to_lowercase())),
+                ("digest", Json::Str(hex::encode(&digest))),
+            ],
+        );
+        return Ok(());
+    }
 
     println!("{} hash:", algo.to_uppercase());
     println!("{}", hex::encode(digest));
@@ -262,7 +419,7 @@ fn pcr_handle_from_index(index: u8) -> Result<PcrHandle> {
         21 => Pcr21,
         22 => Pcr22,
         23 => Pcr23,
-        _ => anyhow::bail!("PCR index must be 0-23"),
+        _ => anyhow::bail!("PCR index out of range: {} (expected 0..23)", index),
     })
 }
 
@@ -277,7 +434,7 @@ pub(crate) fn pcr_extend(context: &mut TpmContext, index: u8, data: &[u8]) -> Re
     let mut values = DigestValues::new();
     values.set(HashingAlgorithm::Sha256, digest);
 
-    info!("Extending PCR {} (SHA-256 bank)...", index);
+    debug!("Extending PCR {} (SHA-256 bank)...", index);
     context
         .execute_with_session(Some(AuthSession::Password), |ctx| {
             ctx.pcr_extend(pcr_handle, values)
@@ -297,7 +454,7 @@ pub(crate) fn pcr_extend(context: &mut TpmContext, index: u8, data: &[u8]) -> Re
 pub(crate) fn pcr_reset(context: &mut TpmContext, index: u8) -> Result<Vec<u8>> {
     let pcr_handle = pcr_handle_from_index(index)?;
 
-    info!("Resetting PCR {}...", index);
+    debug!("Resetting PCR {}...", index);
     context
         .execute_with_session(Some(AuthSession::Password), |ctx| ctx.pcr_reset(pcr_handle))
         .context("Failed to reset PCR")?;
@@ -314,11 +471,25 @@ pub(crate) fn cmd_pcr_extend(
     index: u8,
     data: &str,
     force: bool,
+    json: bool,
 ) -> Result<()> {
+    check_pcr_index(index)?;
     check_pcr_extend_allowed(index, force)?;
 
     let input_digest = hash_bytes(context, data.as_bytes(), HashingAlgorithm::Sha256)?;
     let new_digest = pcr_extend(context, index, data.as_bytes())?;
+
+    if json {
+        print_json(
+            "tpm-ops.pcr-extend.v1",
+            vec![
+                ("index", Json::UInt(index as u64)),
+                ("input_digest", Json::Str(hex::encode(&input_digest))),
+                ("new_value", Json::Str(hex::encode(&new_digest))),
+            ],
+        );
+        return Ok(());
+    }
 
     println!("Extended PCR {} (SHA-256)", index);
     println!("  Input digest: {}", hex::encode(&input_digest));
@@ -327,10 +498,22 @@ pub(crate) fn cmd_pcr_extend(
     Ok(())
 }
 
-pub(crate) fn cmd_pcr_reset(context: &mut TpmContext, index: u8) -> Result<()> {
+pub(crate) fn cmd_pcr_reset(context: &mut TpmContext, index: u8, json: bool) -> Result<()> {
+    check_pcr_index(index)?;
     check_pcr_reset_allowed(index)?;
 
     let new_digest = pcr_reset(context, index)?;
+
+    if json {
+        print_json(
+            "tpm-ops.pcr-reset.v1",
+            vec![
+                ("index", Json::UInt(index as u64)),
+                ("new_value", Json::Str(hex::encode(&new_digest))),
+            ],
+        );
+        return Ok(());
+    }
 
     println!("Reset PCR {}", index);
     println!("  PCR value: {}", hex::encode(&new_digest));

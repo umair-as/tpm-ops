@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use anyhow::{Context, Result};
-use log::info;
+use log::debug;
 
 use tss_esapi::{
     attributes::ObjectAttributesBuilder,
@@ -24,6 +24,7 @@ use tss_esapi::{
 
 use crate::{
     commands::random_bytes,
+    output::{print_json, Json},
     tpm::{create_srk, parse_pcr_indices, pcr_selection_sha256, KeyGuard},
 };
 
@@ -132,6 +133,35 @@ pub(crate) fn quote_public_fingerprint_from_file(
     let blob = QuoteBlob::parse(&raw)?;
     let public_bytes = hex::decode(&blob.ak_pub_hex).context("Invalid ak_pub hex in blob")?;
     ak_public_fingerprint(context, &public_bytes)
+}
+
+/// Print a quote blob's AK fingerprint. This is a read of blob-internal data
+/// only — it carries none of the trust `quote-verify` establishes. See
+/// `quote-verify --help` for why the fingerprint must come from an
+/// independent channel before it's trusted for anything.
+pub(crate) fn cmd_quote_fingerprint(
+    context: &mut TpmContext,
+    in_path: &str,
+    json: bool,
+) -> Result<()> {
+    let fingerprint = quote_public_fingerprint_from_file(context, in_path)?;
+
+    if json {
+        print_json(
+            "tpm-ops.quote-fingerprint.v1",
+            vec![
+                ("path", Json::Str(in_path.to_string())),
+                ("ak_sha256", Json::Str(fingerprint)),
+                ("trusted", Json::Bool(false)),
+            ],
+        );
+        return Ok(());
+    }
+
+    println!("AK SHA-256: {}", fingerprint);
+    println!("\nThis is what the blob claims — it is NOT verified or trusted.");
+    println!("Only trust a fingerprint obtained through a separate, out-of-band channel.");
+    Ok(())
 }
 
 /// Create an ephemeral restricted RSA signing key (AK) under the SRK.
@@ -290,6 +320,7 @@ pub(crate) fn cmd_quote(
     nonce_opt: Option<&str>,
     algo: &str,
     out_opt: Option<&str>,
+    json: bool,
 ) -> Result<()> {
     let pcr_indices = parse_pcr_indices(pcrs)?;
     let pcrs_normalized = pcr_indices
@@ -321,7 +352,7 @@ pub(crate) fn cmd_quote(
         ),
     };
 
-    info!("Creating ephemeral {} AK under SRK...", algo.to_uppercase());
+    debug!("Creating ephemeral {} AK under SRK...", algo.to_uppercase());
     let srk = create_srk(context)?;
     let (ak_handle, ak_pub) = if is_ecc {
         create_ak_ecc(srk, context)?
@@ -331,7 +362,7 @@ pub(crate) fn cmd_quote(
     let ak_guard = KeyGuard::new(context, ak_handle);
     let ak_handle_copy = ak_guard.handle();
 
-    info!("Running TPM2_Quote (PCRs SHA-256:{})...", pcrs_normalized);
+    debug!("Running TPM2_Quote (PCRs SHA-256:{})...", pcrs_normalized);
 
     // Restricted keys use the key's own scheme; pass Null to the quote call.
     let (attest, signature) = ak_guard
@@ -354,34 +385,64 @@ pub(crate) fn cmd_quote(
     let ak_pub_hex = hex::encode(ak_pub_buffer.value());
     let ak_pub_sha256 = ak_public_fingerprint(ak_guard.context, ak_pub_buffer.value())?;
 
-    // Print summary.
-    println!("PCRs:        SHA-256:{}", pcrs_normalized);
-    println!("Nonce:       {}", nonce_hex);
-    println!("Algo:        {}", algo.to_uppercase());
-    println!("AK SHA-256:  {}", ak_pub_sha256);
-    println!("Firmware:    0x{:016X}", attest.firmware_version());
-    if let AttestInfo::Quote { info } = attest.attested() {
-        println!("PCR digest:  {}", hex::encode(info.pcr_digest().value()));
-    }
+    let pcr_digest_hex = match attest.attested() {
+        AttestInfo::Quote { info } => Some(hex::encode(info.pcr_digest().value())),
+        _ => None,
+    };
 
     let blob = QuoteBlob {
         algo: normalized_algo,
-        pcrs: pcrs_normalized,
-        nonce_hex,
+        pcrs: pcrs_normalized.clone(),
+        nonce_hex: nonce_hex.clone(),
         attest_hex: hex::encode(&attest_bytes),
         sig_hex,
         ak_pub_hex,
     };
+    let serialized = blob.serialize();
 
-    match out_opt {
+    let written_path = match out_opt {
         Some(path) => {
-            fs::write(Path::new(path), blob.serialize())
+            fs::write(Path::new(path), &serialized)
                 .with_context(|| format!("Failed to write quote blob to {}", path))?;
-            println!("\nQuote written to {}", path);
+            Some(path.to_string())
         }
+        None => None,
+    };
+
+    if json {
+        let mut fields = vec![
+            ("pcrs", Json::Str(pcrs_normalized)),
+            ("nonce", Json::Str(nonce_hex)),
+            ("algo", Json::Str(algo.to_lowercase())),
+            ("ak_sha256", Json::Str(ak_pub_sha256)),
+            (
+                "firmware",
+                Json::Str(format!("0x{:016x}", attest.firmware_version())),
+            ),
+            ("pcr_digest", Json::Str(pcr_digest_hex.unwrap_or_default())),
+        ];
+        match &written_path {
+            Some(path) => fields.push(("path", Json::Str(path.clone()))),
+            None => fields.push(("blob", Json::Str(serialized.clone()))),
+        }
+        print_json("tpm-ops.quote.v1", fields);
+        return Ok(());
+    }
+
+    println!("PCRs:        SHA-256:{}", blob.pcrs);
+    println!("Nonce:       {}", blob.nonce_hex);
+    println!("Algo:        {}", algo.to_uppercase());
+    println!("AK SHA-256:  {}", ak_pub_sha256);
+    println!("Firmware:    0x{:016X}", attest.firmware_version());
+    if let Some(digest) = &pcr_digest_hex {
+        println!("PCR digest:  {}", digest);
+    }
+
+    match &written_path {
+        Some(path) => println!("\nQuote written to {}", path),
         None => {
             println!("\n--- Quote Blob ---");
-            print!("{}", blob.serialize());
+            print!("{}", serialized);
         }
     }
 
@@ -399,6 +460,7 @@ pub(crate) fn cmd_quote_verify(
     expected_nonce_hex: &str,
     expected_ak_pub_sha256: &str,
     expected_pcrs: &str,
+    json: bool,
 ) -> Result<()> {
     let raw = fs::read_to_string(Path::new(in_path))
         .with_context(|| format!("Failed to read quote blob from {}", in_path))?;
@@ -484,6 +546,36 @@ pub(crate) fn cmd_quote_verify(
         anyhow::bail!(
             "Quote blob PCR metadata does not match the verifier's expected PCR selection"
         );
+    }
+
+    if json {
+        print_json(
+            "tpm-ops.quote-verify.v1",
+            vec![
+                ("valid", Json::Bool(true)),
+                ("pcrs", Json::Str(expected_pcrs_normalized)),
+                ("nonce", Json::Str(hex::encode(&expected_nonce))),
+                ("ak_sha256", Json::Str(actual_ak_pub_sha256)),
+                ("clock_ms", Json::UInt(attest.clock_info().clock())),
+                (
+                    "reset_count",
+                    Json::UInt(attest.clock_info().reset_count() as u64),
+                ),
+                (
+                    "restart_count",
+                    Json::UInt(attest.clock_info().restart_count() as u64),
+                ),
+                (
+                    "firmware",
+                    Json::Str(format!("0x{:016x}", attest.firmware_version())),
+                ),
+                (
+                    "pcr_digest",
+                    Json::Str(hex::encode(quote_info.pcr_digest().value())),
+                ),
+            ],
+        );
+        return Ok(());
     }
 
     println!("Signature:   VALID [OK]");

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::info;
+use log::debug;
 
 use tss_esapi::{
     attributes::ObjectAttributesBuilder,
@@ -20,20 +20,26 @@ use tss_esapi::{
     Context as TpmContext, Error as TssError,
 };
 
+use crate::commands::resolve_text_arg;
+use crate::output::{print_json, Json};
 use crate::tpm::{
     parse_handle, parse_pcr_indices, pcr_selection_sha256, persistent_to_esys,
     start_pcr_policy_session, KeyGuard,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn cmd_sign(
     context: &mut TpmContext,
-    data: &str,
+    data: Option<&str>,
+    file: Option<&str>,
     use_ecc: bool,
     key_handle: Option<&str>,
     policy_pcrs: Option<&str>,
+    json: bool,
 ) -> Result<()> {
+    let data = resolve_text_arg(data, file)?;
     match key_handle {
-        Some(h) => cmd_sign_persistent(context, data, h, policy_pcrs),
+        Some(h) => cmd_sign_persistent(context, &data, h, policy_pcrs, json),
         None => {
             if policy_pcrs.is_some() {
                 anyhow::bail!(
@@ -41,7 +47,7 @@ pub(crate) fn cmd_sign(
                      persistent policy-bound key"
                 );
             }
-            cmd_sign_ephemeral(context, data, use_ecc)
+            cmd_sign_ephemeral(context, &data, use_ecc, json)
         }
     }
 }
@@ -165,13 +171,35 @@ fn cmd_sign_persistent(
     data: &str,
     handle_str: &str,
     policy_pcrs: Option<&str>,
+    json: bool,
 ) -> Result<()> {
     let handle_val = parse_handle(handle_str)?;
 
-    info!("Signing with persistent key at 0x{:08X}...", handle_val);
+    debug!("Signing with persistent key at 0x{:08X}...", handle_val);
 
     let (is_ecc, digest_hex, sig_bytes) =
         sign_with_persistent_key(context, data, handle_str, policy_pcrs)?;
+
+    if json {
+        let mut fields = vec![
+            (
+                "algorithm",
+                Json::Str(if is_ecc { "ecdsa" } else { "rsa-ssa" }.to_string()),
+            ),
+            ("key", Json::Str(format!("0x{:08x}", handle_val))),
+            ("digest", Json::Str(digest_hex)),
+            ("signature", Json::Str(hex::encode(&sig_bytes))),
+        ];
+        if is_ecc {
+            fields.push(("r", Json::Str(hex::encode(&sig_bytes[..32]))));
+            fields.push(("s", Json::Str(hex::encode(&sig_bytes[32..]))));
+        }
+        if let Some(pcrs) = policy_pcrs {
+            fields.push(("policy_pcrs", Json::Str(pcrs.to_string())));
+        }
+        print_json("tpm-ops.sign.v1", fields);
+        return Ok(());
+    }
 
     println!("\nData: {}", data);
     println!("Digest (SHA256): {}", digest_hex);
@@ -202,8 +230,13 @@ fn cmd_sign_persistent(
 }
 
 /// Sign with an ephemeral primary key (original behavior).
-fn cmd_sign_ephemeral(context: &mut TpmContext, data: &str, use_ecc: bool) -> Result<()> {
-    info!(
+fn cmd_sign_ephemeral(
+    context: &mut TpmContext,
+    data: &str,
+    use_ecc: bool,
+    json: bool,
+) -> Result<()> {
+    debug!(
         "Creating ephemeral {} primary key in TPM...",
         if use_ecc { "ECC" } else { "RSA" }
     );
@@ -216,7 +249,7 @@ fn cmd_sign_ephemeral(context: &mut TpmContext, data: &str, use_ecc: bool) -> Re
 
     let guard = KeyGuard::new(context, primary_key);
 
-    info!("Primary key created: {:?}", guard.handle());
+    debug!("Primary key created: {:?}", guard.handle());
 
     let data_bytes = data.as_bytes();
     let buffer = MaxBuffer::try_from(data_bytes).context("Data too large")?;
@@ -226,7 +259,7 @@ fn cmd_sign_ephemeral(context: &mut TpmContext, data: &str, use_ecc: bool) -> Re
         .hash(buffer, HashingAlgorithm::Sha256, Hierarchy::Null)
         .context("Failed to hash data")?;
 
-    info!("Signing data...");
+    debug!("Signing data...");
 
     let scheme = if use_ecc {
         SignatureScheme::EcDsa {
@@ -245,6 +278,35 @@ fn cmd_sign_ephemeral(context: &mut TpmContext, data: &str, use_ecc: bool) -> Re
             ctx.sign(key_handle, digest.clone(), scheme, ticket)
         })
         .context("Failed to sign data")?;
+
+    if json {
+        let (algorithm, sig_hex, r, s) = match &signature {
+            tss_esapi::structures::Signature::RsaSsa(sig) => {
+                ("rsa-ssa", hex::encode(sig.signature().value()), None, None)
+            }
+            tss_esapi::structures::Signature::EcDsa(sig) => (
+                "ecdsa",
+                String::new(),
+                Some(hex::encode(sig.signature_r().value())),
+                Some(hex::encode(sig.signature_s().value())),
+            ),
+            _ => ("unknown", String::new(), None, None),
+        };
+        let mut fields = vec![
+            ("algorithm", Json::Str(algorithm.to_string())),
+            ("key", Json::Str("ephemeral".to_string())),
+            ("digest", Json::Str(hex::encode(digest.value()))),
+        ];
+        match (r, s) {
+            (Some(r), Some(s)) => {
+                fields.push(("r", Json::Str(r)));
+                fields.push(("s", Json::Str(s)));
+            }
+            _ => fields.push(("signature", Json::Str(sig_hex))),
+        }
+        print_json("tpm-ops.sign.v1", fields);
+        return Ok(());
+    }
 
     println!("\nData: {}", data);
     println!("Digest (SHA256): {}", hex::encode(digest.value()));

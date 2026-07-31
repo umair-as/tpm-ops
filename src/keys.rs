@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use log::info;
+use log::debug;
 
 use tss_esapi::{
     attributes::ObjectAttributesBuilder,
@@ -21,6 +21,7 @@ use tss_esapi::{
     Context as TpmContext,
 };
 
+use crate::output::{print_json, Json};
 use crate::pem::{der_to_pem, encode_ec_pubkey_der, encode_rsa_pubkey_der};
 use crate::tpm::{
     create_srk, parse_handle, parse_pcr_indices, pcr_policy_digest, pcr_selection_sha256,
@@ -136,6 +137,7 @@ pub(crate) fn cmd_key_create(
     algo: &str,
     persist_str: &str,
     policy_pcrs: Option<&str>,
+    json: bool,
 ) -> Result<()> {
     let handle_val = parse_handle(persist_str)?;
 
@@ -170,7 +172,7 @@ pub(crate) fn cmd_key_create(
         None => None,
     };
 
-    info!("Creating {} child key under SRK...", algo.to_uppercase());
+    debug!("Creating {} child key under SRK...", algo.to_uppercase());
 
     let srk_handle = create_srk(context)?;
 
@@ -183,7 +185,7 @@ pub(crate) fn cmd_key_create(
         })
         .context("Failed to create child key")?;
 
-    info!("Child key created, loading...");
+    debug!("Child key created, loading...");
 
     let child_handle = context
         .execute_with_session(Some(AuthSession::Password), |ctx| {
@@ -208,7 +210,7 @@ pub(crate) fn cmd_key_create(
         .context("Failed to persist key")?;
 
     if let Err(flush_error) = context.flush_context(child_handle.into()) {
-        let rollback_result = cmd_key_delete(context, persist_str);
+        let rollback_result = cmd_key_delete(context, persist_str, true, false);
         match rollback_result {
             Ok(()) => {
                 return Err(flush_error)
@@ -224,6 +226,20 @@ pub(crate) fn cmd_key_create(
                 );
             }
         }
+    }
+
+    if json {
+        let mut fields = vec![
+            ("handle", Json::Str(format!("0x{:08x}", handle_val))),
+            ("algorithm", Json::Str(algo.to_lowercase())),
+            ("policy_bound", Json::Bool(policy.is_some())),
+        ];
+        if let Some((pcrs_normalized, digest)) = &policy {
+            fields.push(("policy_pcrs", Json::Str(pcrs_normalized.clone())));
+            fields.push(("policy_digest", Json::Str(hex::encode(digest.value()))));
+        }
+        print_json("tpm-ops.key-create.v1", fields);
+        return Ok(());
     }
 
     println!(
@@ -262,12 +278,35 @@ pub(crate) fn cmd_key_create(
     Ok(())
 }
 
+struct KeyListEntry {
+    handle_val: u32,
+    algo: String,
+    restricted: String,
+    usage: String,
+    policy_bound: bool,
+    reserved: Option<&'static str>,
+    note: Option<String>,
+}
+
+/// Reserved/special-purpose handles worth flagging in `key list` so it's
+/// obvious which entries are unsafe (or pointless) to delete: the SRK, and
+/// the handle range `tpm-ops test` reserves for its own lifecycle.
+fn reserved_note(handle_val: u32) -> Option<&'static str> {
+    if handle_val == PERSISTENT_SRK_HANDLE {
+        Some("SRK — do not delete")
+    } else if (0x81000FFC..=0x81000FFF).contains(&handle_val) {
+        Some("reserved for `tpm-ops test`")
+    } else {
+        None
+    }
+}
+
 /// List all persistent handles and their key types.
-pub(crate) fn cmd_key_list(context: &mut TpmContext) -> Result<()> {
-    info!("Enumerating persistent handles...");
+pub(crate) fn cmd_key_list(context: &mut TpmContext, json: bool) -> Result<()> {
+    debug!("Enumerating persistent handles...");
 
     let mut property = TPM2_PERSISTENT_FIRST;
-    let mut count = 0u32;
+    let mut entries = Vec::new();
 
     loop {
         let (capability_data, more) = context
@@ -277,7 +316,7 @@ pub(crate) fn cmd_key_list(context: &mut TpmContext) -> Result<()> {
         if let CapabilityData::Handles(handles) = capability_data {
             for &tpm_handle in handles.as_ref() {
                 let handle_val: u32 = tpm_handle.into();
-                count += 1;
+                let reserved = reserved_note(handle_val);
 
                 match persistent_to_esys(context, handle_val) {
                     Ok(obj_handle) => {
@@ -300,7 +339,16 @@ pub(crate) fn cmd_key_list(context: &mut TpmContext) -> Result<()> {
                                         ("ECC", *object_attributes, auth_policy.value().is_empty())
                                     }
                                     other => {
-                                        println!("  0x{:08X}  {:?}", handle_val, other);
+                                        entries.push(KeyListEntry {
+                                            handle_val,
+                                            algo: format!("{:?}", other),
+                                            restricted: String::new(),
+                                            usage: String::new(),
+                                            policy_bound: false,
+                                            reserved,
+                                            note: None,
+                                        });
+                                        property = handle_val + 1;
                                         continue;
                                     }
                                 };
@@ -319,25 +367,36 @@ pub(crate) fn cmd_key_list(context: &mut TpmContext) -> Result<()> {
                                 } else {
                                     "unrestricted"
                                 };
-                                let srk_note = if handle_val == PERSISTENT_SRK_HANDLE {
-                                    "  (SRK)"
-                                } else {
-                                    ""
-                                };
-                                let policy_note = if policy_bound { "  policy-bound" } else { "" };
-                                println!(
-                                    "  0x{:08X}  {}  {}  {}{}{}",
-                                    handle_val, algo, restricted, usage, srk_note, policy_note
-                                );
+                                entries.push(KeyListEntry {
+                                    handle_val,
+                                    algo: algo.to_string(),
+                                    restricted: restricted.to_string(),
+                                    usage: usage.to_string(),
+                                    policy_bound,
+                                    reserved,
+                                    note: None,
+                                });
                             }
-                            Err(e) => {
-                                println!("  0x{:08X}  (read_public failed: {})", handle_val, e);
-                            }
+                            Err(e) => entries.push(KeyListEntry {
+                                handle_val,
+                                algo: String::new(),
+                                restricted: String::new(),
+                                usage: String::new(),
+                                policy_bound: false,
+                                reserved,
+                                note: Some(format!("read_public failed: {}", e)),
+                            }),
                         }
                     }
-                    Err(e) => {
-                        println!("  0x{:08X}  (inaccessible: {})", handle_val, e);
-                    }
+                    Err(e) => entries.push(KeyListEntry {
+                        handle_val,
+                        algo: String::new(),
+                        restricted: String::new(),
+                        usage: String::new(),
+                        policy_bound: false,
+                        reserved,
+                        note: Some(format!("inaccessible: {}", e)),
+                    }),
                 }
 
                 property = handle_val + 1;
@@ -349,17 +408,82 @@ pub(crate) fn cmd_key_list(context: &mut TpmContext) -> Result<()> {
         }
     }
 
-    if count == 0 {
-        println!("No persistent keys found.");
-    } else {
-        println!("\n{} persistent handle(s) found.", count);
+    if json {
+        let keys = entries
+            .iter()
+            .map(|e| {
+                Json::Object(vec![
+                    ("handle", Json::Str(format!("0x{:08x}", e.handle_val))),
+                    ("algo", Json::Str(e.algo.clone())),
+                    ("restricted", Json::Str(e.restricted.clone())),
+                    ("usage", Json::Str(e.usage.clone())),
+                    ("policy_bound", Json::Bool(e.policy_bound)),
+                    (
+                        "reserved",
+                        Json::Str(e.reserved.unwrap_or_default().to_string()),
+                    ),
+                    ("note", Json::Str(e.note.clone().unwrap_or_default())),
+                ])
+            })
+            .collect();
+        print_json(
+            "tpm-ops.key-list.v1",
+            vec![
+                ("count", Json::UInt(entries.len() as u64)),
+                ("keys", Json::Array(keys)),
+            ],
+        );
+        return Ok(());
     }
+
+    if entries.is_empty() {
+        println!("No persistent keys found.");
+        return Ok(());
+    }
+
+    println!(
+        "  {:<12} {:<5} {:<12} {:<9} NOTES",
+        "HANDLE", "ALGO", "RESTRICTED", "USAGE"
+    );
+    for e in &entries {
+        let mut notes = Vec::new();
+        if e.policy_bound {
+            notes.push("policy-bound".to_string());
+        }
+        if let Some(reserved) = e.reserved {
+            notes.push(reserved.to_string());
+        }
+        if let Some(note) = &e.note {
+            notes.push(note.clone());
+        }
+        println!(
+            "  0x{:08X}   {:<5} {:<12} {:<9} {}",
+            e.handle_val,
+            e.algo,
+            e.restricted,
+            e.usage,
+            notes.join(", ")
+        );
+    }
+
+    println!("\n{} persistent handle(s) found.", entries.len());
 
     Ok(())
 }
 
 /// Delete a persistent key by evicting it from the TPM.
-pub(crate) fn cmd_key_delete(context: &mut TpmContext, handle_str: &str) -> Result<()> {
+///
+/// `assume_yes` skips the interactive confirmation — the caller (`main.rs`)
+/// sets it whenever stdin isn't a TTY, `--json` is set, or `--yes` was passed,
+/// so this never blocks a scripted invocation. It's also forced by internal
+/// callers (`cmd_key_create`'s rollback path, `tpm-ops test`'s 4 lifecycle
+/// calls) that must never prompt.
+pub(crate) fn cmd_key_delete(
+    context: &mut TpmContext,
+    handle_str: &str,
+    assume_yes: bool,
+    json: bool,
+) -> Result<()> {
     let handle_val = parse_handle(handle_str)?;
 
     if handle_val == PERSISTENT_SRK_HANDLE {
@@ -370,7 +494,26 @@ pub(crate) fn cmd_key_delete(context: &mut TpmContext, handle_str: &str) -> Resu
         );
     }
 
-    info!("Deleting persistent key at 0x{:08X}...", handle_val);
+    if !persistent_handle_exists(context, handle_val)? {
+        anyhow::bail!("No key found at handle 0x{:08X}", handle_val);
+    }
+
+    if !assume_yes && !confirm_delete(handle_val)? {
+        if json {
+            print_json(
+                "tpm-ops.key-delete.v1",
+                vec![
+                    ("handle", Json::Str(format!("0x{:08x}", handle_val))),
+                    ("deleted", Json::Bool(false)),
+                ],
+            );
+        } else {
+            println!("Aborted — 0x{:08X} was not deleted.", handle_val);
+        }
+        return Ok(());
+    }
+
+    debug!("Deleting persistent key at 0x{:08X}...", handle_val);
 
     let obj_handle = persistent_to_esys(context, handle_val)?;
 
@@ -384,8 +527,36 @@ pub(crate) fn cmd_key_delete(context: &mut TpmContext, handle_str: &str) -> Resu
         })
         .context("Failed to evict persistent key")?;
 
+    if json {
+        print_json(
+            "tpm-ops.key-delete.v1",
+            vec![
+                ("handle", Json::Str(format!("0x{:08x}", handle_val))),
+                ("deleted", Json::Bool(true)),
+            ],
+        );
+        return Ok(());
+    }
+
     println!("Deleted persistent key at 0x{:08X} [OK]", handle_val);
     Ok(())
+}
+
+/// Prompt on stderr and read a y/N answer from stdin. Only called when the
+/// caller has already established stdin is a TTY (`assume_yes` is false).
+fn confirm_delete(handle_val: u32) -> Result<bool> {
+    use std::io::Write;
+    eprint!(
+        "Delete persistent key 0x{:08X}? This cannot be undone. [y/N] ",
+        handle_val
+    );
+    std::io::stderr().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("Failed to read confirmation from stdin")?;
+    let answer = answer.trim().to_lowercase();
+    Ok(answer == "y" || answer == "yes")
 }
 
 /// Export the public portion of a persistent key as PEM.
