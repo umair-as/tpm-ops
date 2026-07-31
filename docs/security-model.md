@@ -71,16 +71,49 @@ If you do pass `--force` to extend a boot-measurement PCR (0–15): understand t
 persists until the next reboot, cannot be undone, and will invalidate any sealed data or
 policy-bound key whose policy covers that PCR.
 
+## Platform boot security model on this target
+
+Measured boot — PCRs reflecting "this specific firmware/kernel actually ran unmodified" — is not
+achievable on the RPi5 + SLB9672 reference target in any near-term supportable way. This is not a
+missing feature to be filed and eventually fixed; it's the result of a deliberate platform design
+decision plus two independent implementation gaps below it:
+
+- **The RPi5's own security model is *signed* boot, not measured boot, by design.** The bootROM
+  requires firmware signed by both the Raspberry Pi key and a customer key whose hash is burned
+  into OTP; nothing in the chain extends a PCR. A Raspberry Pi engineer has stated the platform's
+  position on measured boot directly: it's "somewhat fragile," since a malicious bootloader "could
+  just lie about the hashes to the TPM." This is not expected to change — verified boot is the
+  platform's actual answer, and it's a legitimate one; it's simply not attestable the way PCR
+  measurement is. (See the [RPi5 secure/measured/encrypted boot thread](https://forums.raspberrypi.com/viewtopic.php?t=374103).)
+- **U-Boot has no RP1 SPI driver**, and the SLB9672 sits on RP1's SPI bus (`tpm_tis_spi spi0.1`
+  unlike RPi4, where SPI is SoC-native). The Feb 2025 SUSE RFC series that brought RPi5 support to
+  U-Boot added PCIe/RP1 enumeration, clocks, GPIO, and Ethernet — but not SPI. Even if it existed,
+  U-Boot measuring itself after an unmeasured proprietary bootloader would anchor trust in the
+  wrong place, since the point above means nothing upstream of it is measured either.
+- **IMA cannot bind to the TPM at boot** — [`raspberrypi/linux#6217`](https://github.com/raspberrypi/linux/issues/6217),
+  open and unresolved. IMA initializes from a `late_initcall` before the SPI TPM driver has probed
+  the device, so it activates TPM-bypass and `boot_aggregate` reads all-zero. Verified on hardware:
+  `ima: No TPM chip found, activating TPM-bypass!` at 0.214s, `tpm_tis_spi spi0.1: 2.0 TPM` at
+  5.729s. This is the only tractable blocker of the three — a kernel initcall-ordering problem, not
+  a hardware or vendor-policy one — but fixing it would only measure userspace files into PCR 10,
+  not firmware or kernel load.
+- The obvious escape hatch, UEFI via [`worproject/rpi5-uefi`](https://github.com/worproject/rpi5-uefi),
+  was archived 2025-02-04 with no TCG/TPM support ever added.
+
+**The coherent architecture on this target is signed boot for chain integrity, plus the TPM for
+key protection and anti-rollback** — a different security model from PCR attestation, not a
+degraded version of it. State this as the actual model, not a fallback: the bootROM/EEPROM/`boot.img`
+signature chain is what vouches for "the firmware that ran is the firmware we shipped," and the TPM's
+job is everything signed boot can't do — keeping key material non-exportable, enforcing anti-rollback
+counters, and (see below) still meaningfully binding secrets to *this chip* even without PCR binding.
+
 ## Limitations
 
 Stated plainly, not as an apology — know these before you build on top of this tool.
 
 - **PCR-bound features currently bind to an all-zero PCR state on the reference RPi5 + SLB9672
-  target.** Nothing in the current boot chain measures into the TPM there: the firmware does not
-  extend PCRs, the bootloader stage has no support for this particular TPM's bus path, and the
-  kernel's own measurement subsystem falls back to a TPM-bypass mode before the TPM driver has
-  even probed the device (an initialization-ordering issue, not a fundamentally missing
-  capability). Verified on hardware — every PCR reads as all-zero, on every boot.
+  target**, for the reasons above. Verified on hardware — every PCR reads as all-zero, on every
+  boot.
 
   **What this means in practice:** `seal`/`unseal` and PCR-policy-bound keys work correctly and
   mechanically as designed — the TPM really does refuse the operation if the named PCRs change —
@@ -91,6 +124,12 @@ Stated plainly, not as an apology — know these before you build on top of this
   tamper detection only once something in the boot chain actually extends those PCRs. PCR 16
   (debug) and 23 (application-reserved) are unaffected by this — they're meant to be driven
   directly by an application, which is exactly what `pcr extend`/`pcr reset` and the test suite do.
+
+  What's unaffected: features that bind to *this chip* rather than to PCR state don't need any of
+  the above. A non-exportable signing key (`key create`) and an empty-PCR-list TPM binding (e.g.
+  `systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=`) still defeat the threat of key/disk
+  material being copied off the device — they just don't add firmware-tamper detection on top,
+  which is the piece that specifically requires working PCR measurement.
 
 - **`quote` uses an ephemeral Attestation Key.** A new AK is created under the SRK on every
   `quote` invocation and flushed afterward, so its fingerprint changes every time. This is fine
