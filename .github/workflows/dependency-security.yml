@@ -3,12 +3,13 @@ name: dependency-security
 # GitHub Actions requires the YAML 1.1 boolean-like key `on`.
 # yamllint disable-line rule:truthy
 on:
+  # No path filter on pull_request: `cargo deny` is a required status check
+  # on main's branch protection, so it must run (and report) on every PR
+  # regardless of which files changed — a required context that never
+  # triggers blocks that PR from merging forever. Cheap enough (~30s) that
+  # running it unconditionally costs little. `push` keeps the path filter
+  # since nothing there depends on it reporting to unblock a merge.
   pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "deny.toml"
-      - ".github/workflows/dependency-security.yml"
   push:
     branches: [main]
     paths:
