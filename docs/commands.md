@@ -5,14 +5,24 @@ Every example below was actually run against a software TPM (`swtpm`) — see
 Unix convention: `0` on success, non-zero on failure. `tpm-ops` prints human-readable errors as
 `Error: ...` and returns `1`.
 
-All commands accept the global `-t`/`--tcti` flag before the subcommand:
+All commands accept these global flags before or after the subcommand:
+
+| Flag | Meaning |
+|---|---|
+| `-t`/`--tcti <TCTI>` | Transport (default `device:/dev/tpmrm0`) |
+| `--json` | Emit one machine-readable JSON object on stdout instead of human text. Logs/progress always go to stderr, so `tpm-ops --json <cmd> \| jq .` works with no stderr redirect. Every object carries a `schema` field (e.g. `tpm-ops.pcr.v1`) so consumers can detect shape changes. |
+| `-v`/`--verbose` (repeatable) | `-v` info, `-vv` debug, `-vvv` trace. Default is warnings/errors only. `RUST_LOG` overrides. |
+| `-q`/`--quiet` | Errors only. |
+| `--color auto\|always\|never` | Default `auto` (honours `NO_COLOR` and whether stderr is a TTY). Only colors the `Error:` prefix. |
+| `-y`/`--yes` | Skip the `key delete` confirmation prompt. Implied automatically when stdin isn't a TTY. |
 
 ```
-tpm-ops [-t <TCTI>] <COMMAND>
+tpm-ops [-t <TCTI>] [--json] [-v...] [-q] [--color <mode>] [-y] <COMMAND>
 ```
 
-It defaults to `device:/dev/tpmrm0`. Examples below use `--tcti "swtpm:port=2321"`; drop it (or
-point it at your resource manager) to run against real hardware.
+Examples below use `--tcti "swtpm:port=2321"`; drop it (or point it at your resource manager) to
+run against real hardware. A hidden `tpm-ops completions <bash|zsh|fish|...>` subcommand prints a
+shell completion script.
 
 ## `version`
 
@@ -65,7 +75,9 @@ c0a48bfeab894e4288c3ed1e6ad1dfdb
 ## `hash <data> [--algo sha256|sha384|sha1]`
 
 Hashes data using the TPM's own hash engine (not a local library). `<data>` is treated as hex if
-it looks like an even-length hex string, otherwise as raw text.
+it looks like an even-length hex string, otherwise as raw text. `--file <path>` or `-` (either as
+the positional argument or `--file -`) reads raw bytes from a file or stdin instead — no hex
+auto-detection there, since that only makes sense for a short command-line argument.
 
 ```
 $ tpm-ops --tcti "swtpm:port=2321" hash "hello world"
@@ -125,13 +137,16 @@ cannot be reset without a platform-level action (e.g. reboot).
 exit=1
 ```
 
-## `sign <data> [--ecc] [--key <handle>] [--policy-pcrs <list>]`
+## `sign <data> [--algo rsa|ecc] [--key <handle>] [--policy-pcrs <list>]`
 
-Without `--key`: creates an **ephemeral** primary signing key (RSA-2048 by default, `--ecc` for
-ECC P-256), signs `<data>`, and flushes the key — nothing persists.
+Without `--key`: creates an **ephemeral** primary signing key (RSA-2048 by default, `--algo ecc`
+for ECC P-256), signs `<data>`, and flushes the key — nothing persists. `--ecc` still works as a
+deprecated alias for `--algo ecc`. `<data>` also accepts `--file <path>` or `-` for stdin (must be
+valid UTF-8 text — `sign`'s data has always been a string).
 
-With `--key <handle>`: signs using a persistent key created by `key create`. Algorithm is
-detected from the key itself, not from `--ecc`.
+With `--key <handle>` (alias `--handle`, matching `key delete`/`key export-pub`'s flag form):
+signs using a persistent key created by `key create`. Algorithm is detected from the key itself,
+not from `--algo`/`--ecc`.
 
 ```
 $ tpm-ops --tcti "swtpm:port=2321" sign "hello" --key 0x81000001
@@ -150,10 +165,12 @@ Data signed with persistent key [OK]
 required for, and only valid on, a policy-bound key (`key create --policy-pcrs`). See
 [concepts.md](concepts.md#policy-bound-signing-keys) and the worked example below.
 
-## `verify <data> --key <handle> --sig <hex>`
+## `verify <data> --key <handle> (--sig <hex> | --sig-file <path>)`
 
 Verifies a signature produced by `sign --key`. `--sig` is raw signature bytes as hex for RSA, or
-`R||S` (64 bytes / 128 hex chars) for ECC.
+`R||S` (64 bytes / 128 hex chars) for ECC. An RSA-2048 signature is a 512-character hex string, so
+`--sig-file <path>` (or `--sig-file -` for stdin) is usually more convenient than passing it as a
+command-line argument.
 
 ```
 $ tpm-ops --tcti "swtpm:port=2321" verify "hello" --key 0x81000001 --sig 87b7f339...cec4
@@ -233,29 +250,35 @@ Data signed with persistent key [OK]
 
 ## `key list`
 
-Enumerates all persistent handles with their algorithm, restricted/unrestricted status, and
-usage. Policy-bound keys are marked `policy-bound`.
+Enumerates all persistent handles in an aligned, headered table, with their algorithm,
+restricted/unrestricted status, and usage. Policy-bound keys are marked `policy-bound`; the SRK
+and `tpm-ops test`'s reserved handle range (`0x81000FFC`–`0x81000FFF`) are flagged as such under
+NOTES so it's obvious which entries are unsafe or pointless to delete.
 
 ```
 $ tpm-ops --tcti "swtpm:port=2321" key list
-  0x81000000  RSA  restricted  decrypt  (SRK)
-  0x81000001  RSA  unrestricted  signing
-  0x81000002  ECC  unrestricted  signing
-  0x81000003  ECC  unrestricted  signing  policy-bound
+  HANDLE       ALGO  RESTRICTED   USAGE     NOTES
+  0x81000000   RSA   restricted   decrypt   SRK — do not delete
+  0x81000001   RSA   unrestricted signing
+  0x81000002   ECC   unrestricted signing
+  0x81000003   ECC   unrestricted signing   policy-bound
 
 4 persistent handle(s) found.
 ```
 
-## `key delete <handle>`
+## `key delete <handle>` (or `--handle <handle>`)
 
-Evicts a persistent key. Refuses to delete the SRK (`0x81000000`).
+Evicts a persistent key. Refuses to delete the SRK (`0x81000000`). Prompts for confirmation when
+stdin is a TTY (`--yes` or a non-TTY/`--json` invocation skips the prompt — this is what lets
+`tpm-ops test`, which deletes its 4 reserved-handle test keys per run, never block).
 
 ```
 $ tpm-ops --tcti "swtpm:port=2321" key delete 0x81000001
+Delete persistent key 0x81000001? This cannot be undone. [y/N] y
 Deleted persistent key at 0x81000001 [OK]
 ```
 
-## `key export-pub <handle>`
+## `key export-pub <handle>` (or `--handle <handle>`)
 
 Exports the public portion of a persistent key as PEM (`RSA PUBLIC KEY` for RSA,
 `PUBLIC KEY`/SubjectPublicKeyInfo for ECC).
@@ -348,6 +371,22 @@ Quote verify [OK]
 $ tpm-ops --tcti "swtpm:port=2321" quote-verify quote.blob --nonce 00...00 --ak-pub-sha256 5b84e7f6...96266c --pcrs 0,7; echo "exit=$?"
 Error: Quote nonce does not match the verifier's expected nonce
 exit=1
+```
+
+## `quote-fingerprint <file>`
+
+Prints a quote blob's AK fingerprint — useful for enrolling a key's fingerprint the first time,
+or for reading it back off a blob you already trust for another reason. This is **not**
+verification: it reads blob-internal data with no cryptographic check attached, exactly the kind
+of value `quote-verify` deliberately refuses to trust when it comes from inside a blob. Only trust
+the fingerprint it prints if you already trust this blob's provenance through some other channel.
+
+```
+$ tpm-ops --tcti "swtpm:port=2321" quote-fingerprint quote.blob
+AK SHA-256: 5b84e7f6e2d8b05789626e65fca5281ce507640e01275f06ebbf24d07f96266c
+
+This is what the blob claims — it is NOT verified or trusted.
+Only trust a fingerprint obtained through a separate, out-of-band channel.
 ```
 
 ## `test`
