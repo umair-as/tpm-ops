@@ -70,16 +70,17 @@ jobs:
           # GitHub-hosted runners' default mirrors (notably security.ubuntu.com)
           # don't carry non-native architectures, so a plain `apt-get update`
           # 404s on arm64 indices once the foreign architecture is added.
-          # Restrict the runner's existing sources to its native architecture
-          # and add a dedicated arm64 source pointed at the official ports
-          # mirror, which does carry it.
-          native_arch="$(dpkg --print-architecture)"
+          # Exclude arm64 from the runner's existing sources and add a
+          # dedicated arm64 source pointed at the official ports mirror,
+          # which does carry it. Exclude rather than pin to the native
+          # arch: pinning drops Ubuntu 26.04's amd64v3 variant indices and
+          # apt then tries to downgrade every installed package.
           for f in /etc/apt/sources.list.d/*.sources; do
             [ -e "$f" ] || continue
-            sudo sed -i "/^Types:/a Architectures: ${native_arch}" "$f"
+            sudo sed -i "/^Types:/a Architectures-Remove: arm64" "$f"
           done
           if [ -e /etc/apt/sources.list ]; then
-            sudo sed -i "s/^deb \(http\|mirror\)/deb [arch=${native_arch}] \1/" /etc/apt/sources.list
+            sudo sed -i "s/^deb \(http\|mirror\)/deb [arch-=arm64] \1/" /etc/apt/sources.list
           fi
 
           . /etc/os-release
