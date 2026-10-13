@@ -29,7 +29,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
 
       - name: Install tpm2-tss dev headers
-        run: sudo apt-get install -y --no-install-recommends libtss2-dev
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libtss2-dev
 
       - name: Install pinned CycloneDX generator
         run: cargo install cargo-cyclonedx --version 0.5.9 --locked
